@@ -290,6 +290,73 @@ watch `otel-data/receiver.log` for `401 POST` lines to catch stragglers.
 `.\deploy\start-local.ps1 -BindAll` (it locates Python for you). Only bind beyond
 localhost behind a TLS proxy.
 
+### Running under systemd (Linux hosts without Docker)
+
+Do not leave a hand-started `python3 -m billing.otel.receiver` running as the
+production receiver. It does not survive a crash or a reboot, and its store path
+depends on the directory it was launched from (`OTEL_DB` defaults to the
+cwd-relative `./data/otel.db`). Receiver downtime is *silently* lost revenue —
+telemetry simply stops arriving and no one files a ticket.
+
+`deploy/claude-billing-receiver.service` fixes all three: `Restart=always`,
+absolute store/log paths, `--require-auth`, and an unprivileged user.
+
+**Find what a currently-running receiver is using**, so the unit inherits the same
+store rather than starting an empty one:
+
+```bash
+pid=$(pgrep -f 'billing.otel.receiver')
+readlink /proc/$pid/cwd                                   # where ./data/ resolves to
+tr '\0' '\n' < /proc/$pid/environ | grep -E '^(OTEL_DB|RECEIVER_LOG)='
+```
+
+If those print nothing, the store is `<cwd>/data/otel.db`. Point the unit's
+`Environment=OTEL_DB=` at that exact file — a wrong path here looks like a
+working receiver that has lost every historical row.
+
+**Install:**
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin claudebilling
+sudo chown -R claudebilling:claudebilling /opt/cyclotron/internal-billing-engine/data
+
+# systemd reads .env as root, but billing/config.py also opens it as the service
+# user — an existing-but-unreadable .env raises PermissionError at import.
+sudo chown root:claudebilling /opt/cyclotron/internal-billing-engine/.env
+sudo chmod 640 /opt/cyclotron/internal-billing-engine/.env
+
+sudo cp deploy/claude-billing-receiver.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+**Cut over from a hand-started process.** Both bind `:4318`, so the old one must
+stop before the unit starts, and the token must already be on client machines:
+
+```bash
+sudo kill $(pgrep -f 'billing.otel.receiver')      # frees the port
+sudo systemctl enable --now claude-billing-receiver
+systemctl status claude-billing-receiver --no-pager
+journalctl -u claude-billing-receiver -n 20 --no-pager
+```
+
+The journal must show `auth=ENABLED`. If the unit refuses to start with
+`RECEIVER_AUTH_TOKEN is empty`, systemd could not read the token out of `.env` —
+check the file's permissions and that the value carries no trailing `# ...`
+comment (systemd does not strip them).
+
+**Verify the cutover** — reachability, enforcement, and that history survived:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:4318/v1/metrics -d '{}'   # expect 401
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:4318/v1/metrics \
+     -H "X-Billing-Token: $RECEIVER_AUTH_TOKEN" -d '{}'                                     # expect 200
+python3 -m billing.otel.records --limit 5                                                   # pre-cutover rows still there
+```
+
+Then confirm it actually comes back: `sudo systemctl restart claude-billing-receiver`,
+and ideally reboot the host once during the pilot rather than discovering the
+answer during a live month.
+
 **Production hardening:**
 - **TLS** — dev machines should hit `https://…`, not raw `:4318`. Front the
   receiver with a reverse proxy (Caddy/nginx) or an OpenTelemetry Collector that

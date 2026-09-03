@@ -246,6 +246,10 @@ queryable Delta tables inside Microsoft Fabric.
   `./otel-data` volume; both read the token from `.env` via `env_file`. Includes a
   commented Caddy TLS sidecar for production.
 - **`.dockerignore`** — keeps secrets, data, and local settings out of the build context.
+- **`deploy/claude-billing-receiver.service`** — systemd unit for Linux hosts running
+  the receiver without Docker: restarts on crash and after reboot, pins absolute
+  store/log paths, enforces `--require-auth`, and runs as an unprivileged user.
+  Install and cutover steps in `deploy/README.md`.
 
 ### Repo hygiene
 

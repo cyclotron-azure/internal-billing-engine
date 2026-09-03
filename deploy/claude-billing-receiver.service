@@ -1,0 +1,73 @@
+# systemd unit for the Claude Code usage-telemetry receiver.
+#
+# Replaces starting the receiver by hand. Hand-started processes do not survive
+# a crash or a reboot, and receiver downtime is silently lost revenue — nobody
+# files a ticket for telemetry that stopped arriving. This unit restarts on
+# failure, comes back after boot, enforces the auth token, and drops root.
+#
+# Paths assume the repo at /opt/cyclotron/internal-billing-engine with the store
+# and log under its data/ subdirectory. Adjust all four paths below if yours
+# differ — see deploy/README.md for how to find the ones a running receiver is
+# actually using.
+#
+# Install + migration procedure: deploy/README.md, "Running under systemd".
+
+[Unit]
+Description=Claude Code usage-telemetry receiver (OTLP/JSON)
+Documentation=https://github.com/cyclotron-azure/internal-billing-engine
+After=network-online.target
+Wants=network-online.target
+# Never stop retrying: a receiver that gives up after N fast crashes is an
+# outage nobody is paged for.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=claudebilling
+Group=claudebilling
+WorkingDirectory=/opt/cyclotron/internal-billing-engine
+
+# Supplies RECEIVER_AUTH_TOKEN. systemd does NOT strip trailing "# ..." comments
+# from these lines — the same constraint billing/config.py has — so keep values
+# bare: RECEIVER_AUTH_TOKEN=abc123, not RECEIVER_AUTH_TOKEN=abc123  # fleet token
+EnvironmentFile=/opt/cyclotron/internal-billing-engine/.env
+
+# Absolute paths so the store and log no longer depend on the working directory.
+# The code defaults are cwd-relative (./data/otel.db), which is how a
+# hand-started receiver ends up writing its billing store wherever the operator
+# happened to be standing.
+Environment=OTEL_DB=/opt/cyclotron/internal-billing-engine/data/otel.db
+Environment=RECEIVER_LOG=/opt/cyclotron/internal-billing-engine/data/receiver.log
+Environment=PYTHONUNBUFFERED=1
+
+# --require-auth turns a missing or unreadable token into a startup failure
+# instead of an open billing endpoint. -u keeps the banner and per-request lines
+# flowing to the journal immediately.
+ExecStart=/usr/bin/python3 -u -m billing.otel.receiver \
+    --host 0.0.0.0 --port 4318 --require-auth
+
+Restart=always
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-billing-receiver
+
+# Hardening. 4318 is an unprivileged port, so the service needs no capabilities
+# at all and no write access outside its data directory.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths=/opt/cyclotron/internal-billing-engine/data
+
+[Install]
+WantedBy=multi-user.target
