@@ -247,6 +247,115 @@ session, so you can see how much of the bill each signal is carrying.
 
 ---
 
+## 3b. Personal Claude accounts on work machines
+
+Everything above is deployed per **machine**, so it applies to whichever Claude
+account happens to be signed in. A developer logged into a personal Pro/Max
+account on a work laptop exports to this receiver like anyone else, and that is
+not merely noise:
+
+- their **personal email address** lands in `token_usage` / `cost_usage` and, via
+  `export.py`, in the CSVs shipped to the data lake; and
+- their `claude_code.cost.usage` — spend **Cyclotron never paid**, billed to the
+  individual's own subscription — gets the markup applied and lands on a *client
+  invoice*. That is over-billing a client, not a rounding error.
+
+Two layers, and you want both. The first prevents it; the second is the backstop
+for what the first doesn't cover.
+
+### Layer 1 — block the login (prevention)
+
+`managed-settings.json` pins logins to your Anthropic organization:
+
+```json
+"forceLoginMethod": "claudeai",
+"forceLoginOrgUUID": "<org UUID from claude.ai/admin-settings/organization>"
+```
+
+Claude Code reports an error and **exits at startup** if the claude.ai credential
+in use belongs to any other organization. Substitute the real UUID at MDM deploy
+time, the same way you substitute the fleet token.
+
+Know the edges before you rely on it:
+
+| | |
+|---|---|
+| Enforced for claude.ai logins via | terminal, the **VS Code extension**, and the Agent SDK |
+| Not checked | `claude setup-token` and `/install-github-app` (they apply `forceLoginMethod` only, so they can mint a token in another org) |
+| Not checked | Anthropic profile / federation credentials, and gateway sign-in |
+| Not applicable | cloud-provider sessions (Bedrock/Vertex/Foundry) — restrict those in cloud IAM |
+| Side effect | setting `forceLoginOrgUUID` **blocks** `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `apiKeyHelper` sessions at startup, since org membership can't be verified for an environment credential. Check no one's local scripts depend on those before you roll it out. |
+| Version | all login paths apply it on Claude Code v2.1.212+; older versions enforce it for terminal logins only |
+
+If you also distribute **server-managed settings**, set both keys in *both*
+places — managed-settings sources don't merge, and these two keys aren't among
+the per-key exceptions.
+
+> Claude Desktop is not in the enforced list above, which compounds the coverage
+> gap in §2: it neither exports OTEL nor honours the login pin.
+
+### Layer 2 — refuse out-of-scope usage at ingest (backstop)
+
+`billing/otel/scope.py` classifies every datapoint at the receiver and **drops**
+the ones outside the billing scope before they reach the store. Nothing personal
+is written to disk.
+
+```
+BILLING_ALLOWED_ORG_IDS=org_017BoAX…      # comma-separated Anthropic org UUIDs
+BILLING_ALLOWED_EMAIL_DOMAINS=cyclotron.com
+```
+
+**Set the org list, not just the domain.** A personal Pro/Max account can be
+registered to a `@cyclotron.com` address — domain matching alone waves it
+through. The org UUID is what distinguishes "billing through Cyclotron's
+enterprise org" from "billing to a personal card". `organization.id` was already
+being captured and stored; it just wasn't being used for anything. The receiver
+warns at startup if the org list is unset.
+
+Verdicts:
+
+| | |
+|---|---|
+| `in_scope` | stored and billed |
+| `unknown_user` | no usable `user.email` — **stored and billed**, bucketed as `unknown` by `export.py`. Deliberately not dropped: if an upstream change ever stopped emitting `user.email`, dropping would silently delete real revenue, whereas a growing `unknown` bucket is visible. |
+| `out_of_scope` | dropped, and counted in `scope_rejections` |
+
+`scope_rejections` is **aggregate only** — the email *domain* and the org id,
+never the local part, the user id, the session, or the repo. That is enough to
+notice a misconfigured allowlist without holding anyone's personal identity.
+`python -m billing.otel.bill` prints the summary under **REFUSED AT INGEST**.
+
+> ⚠️ This is a **hygiene control, not a security boundary.** `user.email` and
+> `organization.id` are self-reported OTEL attributes, and the fleet token
+> authenticates a *machine*, not a user (see §4). A developer who wants to forge
+> them can. Layer 1 is the control that actually prevents the login; don't
+> describe Layer 2 to auditors as if it were an access control.
+
+> ⚠️ Dropping is **irreversible** — a refused datapoint cannot be recovered, and
+> Claude Code buffers in memory only, so it won't be re-sent. Roll out with the
+> allowlist verified: run the receiver, have one developer from each expected
+> domain start a session, and confirm nothing unexpected shows up under REFUSED
+> AT INGEST before you trust a month's billing to it.
+
+### Verify
+
+```
+# a personal account is refused; a work account is not
+python -m billing.otel.bill --db ./otel-data/otel.db   # see REFUSED AT INGEST
+
+sqlite3 ./otel-data/otel.db \
+  "SELECT day, reason, domain, org_id, datapoints FROM scope_rejections ORDER BY day DESC;"
+```
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| A legitimate domain appears under REFUSED AT INGEST | Allowlist is wrong or incomplete | Fix `BILLING_ALLOWED_*` and restart the receiver. Already-dropped datapoints are gone — they cannot be replayed. |
+| `refused=` climbing but `scope_rejections` empty | Receiver not committing | Rejections commit with the batch; check the receiver log for errors |
+| Everything refused, `by org` | `BILLING_ALLOWED_ORG_IDS` has the wrong UUID (org IDs are **case-sensitive**) | Copy it verbatim from claude.ai/admin-settings/organization |
+| Personal accounts still billed | Only the domain list is set, and the account uses a work email | Set `BILLING_ALLOWED_ORG_IDS` |
+
+---
+
 ## 4. Hosting the receiver (server side)
 
 The receiver is the endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` points at. It must run

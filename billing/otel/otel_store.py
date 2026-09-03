@@ -118,6 +118,22 @@ CREATE TABLE IF NOT EXISTS fabric_outbox (
 );
 CREATE INDEX IF NOT EXISTS ix_outbox_status ON fabric_outbox(status, next_attempt_at);
 
+-- Datapoints refused by billing.otel.scope (a non-Cyclotron account exporting
+-- to the receiver — typically a personal Claude login on a work machine).
+-- AGGREGATE ONLY, on purpose: the email DOMAIN and the org id, never the local
+-- part, the user id, the session or the repo. Dropping at ingest is
+-- irreversible, so this is what makes the drops visible — a misconfigured
+-- allowlist shows up here as a spike instead of as silently missing revenue.
+CREATE TABLE IF NOT EXISTS scope_rejections (
+  day TEXT,                        -- UTC date the datapoint was refused
+  reason TEXT,                     -- 'org' | 'domain'
+  domain TEXT,                     -- email domain only ('' if none)
+  org_id TEXT,
+  datapoints INTEGER,
+  last_seen_at TEXT,
+  PRIMARY KEY (day, reason, domain, org_id)
+);
+
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -176,6 +192,27 @@ class OtelStore:
              user_email, user_id, org_id, model, query_source,
              float(cost_usd or 0), _now()))
         return cur.rowcount > 0
+
+    # ---- refused (out-of-scope) datapoints -----------------------------
+    def record_scope_rejection(self, *, reason, domain, org_id, n=1) -> None:
+        """Count one refused datapoint. Aggregate only — see the table comment."""
+        self.db.execute(
+            """INSERT INTO scope_rejections
+                 (day, reason, domain, org_id, datapoints, last_seen_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(day, reason, domain, org_id) DO UPDATE SET
+                 datapoints = datapoints + excluded.datapoints,
+                 last_seen_at = excluded.last_seen_at""",
+            (_now()[:10], reason, domain or "", org_id or "", int(n), _now()))
+
+    def scope_rejection_summary(self) -> list:
+        """Refused datapoints grouped by domain/org, most recent activity first."""
+        return self.db.execute(
+            """SELECT reason, domain, org_id, SUM(datapoints) datapoints,
+                      MIN(day) first_day, MAX(day) last_day
+               FROM scope_rejections
+               GROUP BY reason, domain, org_id
+               ORDER BY datapoints DESC""").fetchall()
 
     # ---- session -> repo timeline (fed by the CwdChanged hook) ---------
     def insert_session_repo(self, *, session_id, ts, seq, repo, repo_raw, cwd,

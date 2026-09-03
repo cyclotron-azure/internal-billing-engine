@@ -163,6 +163,26 @@ def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
         print("   Split by the timeline's as-of join. Review before invoicing —")
         print("   a switch inside one 60s export interval lands wholly on one side.")
 
+    # Out-of-scope accounts refused at ingest (billing.otel.scope). Shown here
+    # because this is where someone would otherwise notice revenue "missing":
+    # a wrong allowlist looks exactly like a quiet month until you see the
+    # rejected domain named.
+    refused = store.scope_rejection_summary()
+    if refused:
+        total_refused = sum(r["datapoints"] or 0 for r in refused)
+        print(f"\n⚠  REFUSED AT INGEST — {total_refused} datapoint(s) from accounts")
+        print("   outside the billing scope (personal Claude logins on work machines).")
+        print("   Never stored, never billed; only these counts were kept.")
+        rule()
+        for r in refused:
+            who = r["domain"] or r["org_id"] or "(no identity)"
+            span = r["first_day"] if r["first_day"] == r["last_day"] else \
+                f"{r['first_day']}..{r['last_day']}"
+            print(f"     {who:<28} {r['datapoints']:>7}  by {r['reason']:<7} {span}")
+        print("   A domain you expected to be BILLED appearing here means the")
+        print("   allowlist is wrong — fix BILLING_ALLOWED_* and have those")
+        print("   machines re-export; dropped datapoints cannot be recovered.")
+
     if unattributed:
         print("\n⚠  UNATTRIBUTED usage -> 'unknown' bucket, not tied to any repo.")
         print("   'no_remote' = ran outside a git repo (genuinely unbillable).")

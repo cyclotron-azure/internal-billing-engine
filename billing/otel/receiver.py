@@ -43,6 +43,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from ..config import load_env
 from .normalize import normalize_remote
 from .otel_store import OtelStore
+from .scope import OUT_OF_SCOPE, classify, describe as describe_scope, policy
 
 load_env()
 
@@ -145,10 +146,31 @@ def _common(res: dict, dp: dict) -> dict:
     }
 
 
+def _refuse(c: dict, store: OtelStore) -> bool:
+    """True if this datapoint is out of billing scope (and record that it was).
+
+    Only the email DOMAIN and the org id reach the ledger — never the address
+    itself. That is the whole point of refusing at ingest: the personal
+    identity is dropped on the floor, and what remains is enough to notice a
+    misconfigured allowlist.
+    """
+    verdict, reason, domain = classify(c["user_email"], c["org_id"])
+    if verdict != OUT_OF_SCOPE:
+        return False
+    store.record_scope_rejection(reason=reason, domain=domain, org_id=c["org_id"])
+    return True
+
+
 def ingest_metrics_payload(payload: dict, store: OtelStore) -> dict:
     """Parse an OTLP/JSON ExportMetricsServiceRequest, routing the token and
-    cost metrics into their tables."""
-    tok_ins = tok_dup = cost_ins = cost_dup = 0
+    cost metrics into their tables.
+
+    Datapoints from an account outside the billing scope (see billing.otel.scope
+    — typically a personal Claude login on a work machine) are refused HERE, so
+    a personal email address is never written to the store or shipped onward.
+    Only an aggregate count survives, in scope_rejections.
+    """
+    tok_ins = tok_dup = cost_ins = cost_dup = refused = 0
     names = set()
     for rm in payload.get("resourceMetrics", []):
         res = _attrs(rm.get("resource", {}).get("attributes"))
@@ -159,6 +181,9 @@ def ingest_metrics_payload(payload: dict, store: OtelStore) -> dict:
                 if name == TOKEN_METRIC:
                     for dp in _datapoints(metric):
                         c = _common(res, dp)
+                        if _refuse(c, store):
+                            refused += 1
+                            continue
                         val = dp.get("asInt", dp.get("asDouble", 0))
                         ok = store.insert_datapoint(
                             session_id=c["session_id"], repo=c["repo"],
@@ -172,6 +197,9 @@ def ingest_metrics_payload(payload: dict, store: OtelStore) -> dict:
                 elif name == COST_METRIC:
                     for dp in _datapoints(metric):
                         c = _common(res, dp)
+                        if _refuse(c, store):
+                            refused += 1
+                            continue
                         val = dp.get("asDouble", dp.get("asInt", 0))
                         ok = store.insert_cost_datapoint(
                             session_id=c["session_id"], repo=c["repo"],
@@ -185,6 +213,7 @@ def ingest_metrics_payload(payload: dict, store: OtelStore) -> dict:
     store.commit()
     return {"inserted": tok_ins + cost_ins, "token_inserted": tok_ins,
             "cost_inserted": cost_ins, "duplicate": tok_dup + cost_dup,
+            "refused": refused,
             "metrics_seen": sorted(n for n in names if n)}
 
 
@@ -255,6 +284,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = ingest_metrics_payload(json.loads(raw or b"{}"), self.store)
                 msg = (f"/v1/metrics tok+={result['token_inserted']} "
                        f"cost+={result['cost_inserted']} dup={result['duplicate']} "
+                       f"refused={result['refused']} "
                        f"metrics_seen={result['metrics_seen']}")
                 print(f"[receiver] {msg}")
                 _log(msg)
@@ -294,6 +324,18 @@ def serve(host: str, port: int, db: str | None = None, require_auth: bool = Fals
     if not AUTH_TOKEN:
         print("[receiver] WARNING: RECEIVER_AUTH_TOKEN is unset — any client that can "
               "reach this port can write billing rows. Set it to require a token.")
+    print(f"[receiver] {describe_scope()}")
+    allowed_orgs, allowed_domains = policy()
+    if not allowed_orgs and not allowed_domains:
+        print("[receiver] WARNING: scope filtering is OFF — usage from ANY Claude account "
+              "that reaches this port is billed, including personal logins on work "
+              "machines. Set BILLING_ALLOWED_ORG_IDS / BILLING_ALLOWED_EMAIL_DOMAINS.")
+    elif not allowed_orgs:
+        # The domain check alone passes a personal Pro/Max account registered to
+        # a work email address — exactly the case this filter exists for.
+        print("[receiver] WARNING: BILLING_ALLOWED_ORG_IDS is unset — a personal Claude "
+              "account registered to an allowed email domain would still be billed. "
+              "Set it to your Anthropic org UUID.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

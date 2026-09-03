@@ -1,4 +1,6 @@
 {
+  "forceLoginMethod": "claudeai",
+  "forceLoginOrgUUID": "REPLACE_WITH_CYCLOTRON_ORG_UUID",
   "env": {
     "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "OTEL_METRICS_EXPORTER": "otlp",

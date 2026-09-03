@@ -146,6 +146,7 @@ Shared:
   `python -m billing.otel.receiver` (`--host`, `--port`, `--db`, `--require-auth`)
 - **`attribute.py`** — resolves *which repo a datapoint bills to*, at query time. Joins the `session_repo_timeline` onto each datapoint as-of its own timestamp, so a session that moved between repos splits across them. Falls back through `timeline → wrapper → no_remote → absent`, and exposes that choice as `attribution_source` so you can see which signal is carrying the bill. Resolution is derived, never stored: a late or corrected timeline retroactively fixes past bills with no re-ingest.
 - **`otel_store.py`** — SQLite store: deduped `token_usage` and `cost_usage` datapoints, the `session_repo_timeline`, persisted invoices + line items, the optional `repo_name_map` override table, and the `fabric_outbox` delivery queue.
+- **`scope.py`** — decides, at ingest, whether a datapoint belongs to Cyclotron. Telemetry is deployed per *machine*, so a personal Claude login on a work laptop exports here too — carrying a personal email into the store and the data lake, and carrying cost Cyclotron never paid onto a client invoice. Matches `organization.id` against `BILLING_ALLOWED_ORG_IDS` and the `user.email` domain against `BILLING_ALLOWED_EMAIL_DOMAINS`; out-of-scope datapoints are **dropped before storage** and counted (domain + org only) in `scope_rejections`. Datapoints with no email are kept and bucketed as `unknown`. A hygiene control, not a security boundary — `forceLoginOrgUUID` in `deploy/managed-settings.json` is what actually prevents the login.
 - **`normalize.py`** — collapses git remote forms (ssh vs https, `.git`, case) into one canonical repo key so a repo isn't billed twice, and derives the short repo name (`repo_name`) that is the billing identity.
 - **`repos.py`** — manage the OPTIONAL repo→billing-name override map: `export` observed repos to CSV, edit the `bill_name` column to rename/group a repo, then `import`. Not needed by default — every repo bills under its own name.
   `python -m billing.otel.repos export --out repo_name_map.csv`
@@ -164,10 +165,12 @@ Shared:
 ### `deploy/` — client-side rollout (pushed via MDM, enforced)
 
 - **`managed-settings.json`** — enforces telemetry ON, the exporter endpoint, the
-  fleet billing token, and the repo-tag hook registration. Placed at the
-  system-level managed-settings path so developers can't disable it. Ships with
-  `REPLACE_WITH_FLEET_BILLING_TOKEN` placeholders — MDM substitutes the real
-  token at deploy time; **never commit the real value.**
+  fleet billing token, the repo-tag hook registration, and (`forceLoginMethod` /
+  `forceLoginOrgUUID`) that developers sign in with a Cyclotron claude.ai account
+  rather than a personal one. Placed at the system-level managed-settings path so
+  developers can't disable it. Ships with `REPLACE_WITH_FLEET_BILLING_TOKEN` and
+  `REPLACE_WITH_CYCLOTRON_ORG_UUID` placeholders — MDM substitutes the real values
+  at deploy time; **never commit the real token.**
 - **`claude-wrapper.sh`** — the `claude` entrypoint on each machine; stamps every
   session with `OTEL_RESOURCE_ATTRIBUTES=repo=<git remote>` at launch.
 - **`claude-repo-tag.py`** — the hook that keeps attribution correct *during* a
@@ -392,6 +395,12 @@ the only billable surface. Both are coverage problems wearing UX clothing.
 Re-confirm the VS Code limitation against the current Claude Code version before
 building policy on it.
 
+A third: telemetry config is per **machine**, so a personal Claude account on a
+work laptop exports here too — putting a personal email in the data lake and
+putting cost Cyclotron never paid on a client invoice. Handled in two layers
+(`forceLoginOrgUUID` to block the login, `billing/otel/scope.py` to refuse the
+usage at ingest); see **deploy/README.md §3b**.
+
 ### Phase 0 — Decisions and clearances (before any infra)
 
 1. **Fleet size + peak concurrent sessions.** The branch point for *Harden*:
@@ -487,7 +496,11 @@ Push via MDM in waves (10% → 50% → 100%), watching receiver load and the
 billing to the wrong client, and it is the only one that covers non-CLI surfaces.
 
 1. `managed-settings.json` to the system path for each OS, with the real fleet
-   token substituted for the placeholders.
+   token and the real Cyclotron org UUID substituted for the placeholders. Set
+   `BILLING_ALLOWED_ORG_IDS` on the receiver to that same UUID in the same wave —
+   the login pin and the ingest filter are the two halves of one control
+   (deploy/README.md §3b), and shipping only the second means personal accounts
+   are silently dropped rather than blocked.
 2. Real binary at `/opt/cyclotron/claude-real`, `claude-wrapper.sh` as the only
    `claude` on PATH, and **`CLAUDE_REAL_BIN` pinned** — auto-discovery exists, but
    across Homebrew/npm/nvm installs PATH-order guessing is how you get a wrapper
