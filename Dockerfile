@@ -14,4 +14,9 @@ VOLUME ["/data"]
 EXPOSE 4318
 
 # Bind to all interfaces inside the container (the host/proxy controls exposure).
-CMD ["python", "-m", "billing.otel.receiver", "--host", "0.0.0.0", "--port", "4318"]
+# --require-auth: refuse to start unless RECEIVER_AUTH_TOKEN is set, so a missing
+# token is a loud startup failure instead of an open billing endpoint. Pass the
+# token in with `--env-file .env` (docker run) or `env_file:` (compose). Override
+# the command to drop the flag only for a throwaway localhost test.
+CMD ["python", "-m", "billing.otel.receiver", \
+     "--host", "0.0.0.0", "--port", "4318", "--require-auth"]

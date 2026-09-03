@@ -265,9 +265,25 @@ docker compose logs receiver     # must print: auth=ENABLED
 - SQLite store + request log persist in `./otel-data` on the host.
 - Stdlib-only image (no dependencies).
 
+Both the image and the compose service run with `--require-auth`, so an empty
+`RECEIVER_AUTH_TOKEN` is a startup failure, not a silently open endpoint — if the
+token is missing the container exits with:
+
+```
+[receiver] --require-auth set but RECEIVER_AUTH_TOKEN is empty — refusing to start.
+```
+
 **`auth=DISABLED` in that log line means the receiver is open** — anything that can
-reach the port can write rows into billing truth. Fine for a localhost test, never
-for a hosted endpoint.
+reach the port can write rows into billing truth. That state is only reachable now
+by deliberately overriding the command to drop `--require-auth`. Fine for a
+localhost test, never for a hosted endpoint.
+
+**Enforcement is a cutover, not a toggle** — once the token is required, any client
+still sending without it gets `401` and its telemetry is dropped, unbilled and
+without an error the developer will notice. Push the token to every enrolled
+machine (`OTEL_EXPORTER_OTLP_HEADERS` + `CLAUDE_BILLING_TOKEN`, see
+`deploy/managed-settings.json` and the client package) *before* enabling, then
+watch `otel-data/receiver.log` for `401 POST` lines to catch stragglers.
 
 **No Docker?** The engine is stdlib-only, so it runs directly:
 `python3 -m billing.otel.receiver --host 0.0.0.0 --require-auth`, or on Windows

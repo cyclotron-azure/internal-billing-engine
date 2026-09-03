@@ -10,9 +10,19 @@ services:
       - "4318:4318"          # OTLP/JSON in; front with TLS in production (see below)
     volumes:
       - ./otel-data:/data
+    # RECEIVER_AUTH_TOKEN comes from .env. Without this the container never sees
+    # the token (only billing/ is copied into the image, not .env) and the
+    # receiver would start OPEN — anything reaching the port could write rows.
+    env_file:
+      - .env
     environment:
       OTEL_DB: /data/otel.db
       RECEIVER_LOG: /data/receiver.log
+    # --require-auth makes an empty RECEIVER_AUTH_TOKEN a startup failure rather
+    # than a silent reopening. To run open deliberately (localhost test only),
+    # drop the flag here — never on a hosted endpoint.
+    command: ["python", "-m", "billing.otel.receiver",
+              "--host", "0.0.0.0", "--port", "4318", "--require-auth"]
 
   # Sync worker: refresh the current month's invoices + ship CSVs to external
   # storage (ADLS Gen2 / OneLake), self-pacing at the cadence in SYNC_FREQUENCY

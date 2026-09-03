@@ -238,10 +238,13 @@ queryable Delta tables inside Microsoft Fabric.
 ### Container & compose
 
 - **`Dockerfile`** — image for the telemetry receiver (stdlib-only, `python:3.12-slim`);
-  persists the store + request log on a mounted `/data` volume, exposes `4318`.
+  persists the store + request log on a mounted `/data` volume, exposes `4318`, and
+  runs with `--require-auth` so a missing `RECEIVER_AUTH_TOKEN` fails at startup
+  instead of serving an open billing endpoint.
 - **`docker-compose.yml`** — hosts the `receiver` service plus the long-running
   `sync` worker (self-pacing scheduler shipping CSVs to the lake), sharing one
-  `./otel-data` volume; includes a commented Caddy TLS sidecar for production.
+  `./otel-data` volume; both read the token from `.env` via `env_file`. Includes a
+  commented Caddy TLS sidecar for production.
 - **`.dockerignore`** — keeps secrets, data, and local settings out of the build context.
 
 ### Repo hygiene
