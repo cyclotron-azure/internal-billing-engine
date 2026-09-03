@@ -109,7 +109,6 @@ billing/            Python package — both pipelines + reconciliation
   otel/             the OTEL (repo-level) path
 deploy/             client-side config pushed to dev machines (MDM, enforced)
 client-package/     opt-in, one-click installer developers run themselves
-pilot-package/      the earlier opt-in package — superseded by client-package/
 fabric/             Fabric-side notebook + docs (CSV → Delta tables)
 data/               generated SQLite stores + logs (gitignored)
 .claude/            local Claude Code settings (gitignored)
@@ -197,20 +196,18 @@ developers never open a terminal.
 - **`INSTRUCTIONS.md`** — developer-facing: install, what's collected, verify, uninstall.
 - **`build.py`** — builds the zip and refuses to package a source file containing
   an API key or 64-char hex token. Bump `VERSION` when anything here changes.
+
+This replaced an earlier `pilot-package/`, removed from the repo once it was
+superseded. That package set `OTEL_LOGS_EXPORTER=none`, which Claude Code rejects
+(see `deploy/README.md`), so **any machine that ran the old pilot still carries the
+bad key** — `configure.py` deletes it, so running this installer is also the
+cleanup. Nothing needs uninstalling first.
 - **`configure.py`** — the actual install/uninstall/verify logic, shared by both
   platforms; merges into an existing `~/.claude/settings.json` atomically, with a
   timestamped backup. The launchers and shims are wrappers around this — if you
   add a platform, write another shim rather than reimplementing the merge.
 - **`Install`/`Verify`/`Uninstall` `.command` / `.bat`** — the one-click launchers
   (macOS / Windows), wrapping `install.sh` / `install.ps1`.
-
-### `pilot-package/` — superseded
-
-The original opt-in package: bash-only, refused to touch an existing
-`~/.claude/settings.json`, and set `OTEL_LOGS_EXPORTER=none` (which Claude Code
-rejects — see `deploy/README.md`). Kept for reference. **Send anyone enrolling
-today the `client-package/` build instead**; running its installer also cleans up
-the bad key on machines that ran the pilot.
 
 ### `data/` — generated (gitignored)
 

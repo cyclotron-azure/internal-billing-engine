@@ -196,6 +196,9 @@ rate at each step.
 
 ## Fixed relative to `pilot-package/`
 
+That folder has been removed from the repo; this section records what it got wrong,
+because `configure.py` still carries cleanup code for machines that ran it.
+
 - **One click instead of a command line.** Developers double-click a file; they
   never open a terminal, paste a URL, or handle a token. The endpoint and token
   ride along in `billing-config.json` — see the tradeoff above, it is not free.
