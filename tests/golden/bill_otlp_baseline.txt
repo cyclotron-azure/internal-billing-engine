@@ -1,0 +1,45 @@
+====================================================================
+PER-REPO BILL  (OTEL repo-attributed Claude Code usage)
+basis: ACTUAL cost from claude_code.cost.usage  x1.50 markup
+====================================================================
+
+globex-api
+--------------------------------------------------------------------
+  repos:  github.com/cyclotron/globex-api
+  tokens: 300.0K
+    claude-opus-4-8                  $   20.0000
+  cost basis                         $   20.0000
+  BILLED (x1.50)                     $   30.0000
+
+acme-web
+--------------------------------------------------------------------
+  repos:  github.com/cyclotron/acme-web
+  tokens: 380.0K
+    claude-sonnet-5                  $   10.0000
+  cost basis                         $   10.0000
+  BILLED (x1.50)                     $   15.0000
+
+unknown
+--------------------------------------------------------------------
+  repos:  unknown
+  tokens: 8.5K
+    claude-haiku-4-5                 $    5.0000
+  cost basis                         $    5.0000
+  BILLED (x1.50)                     $    7.5000
+====================================================================
+GRAND TOTAL cost basis               $   35.0000
+GRAND TOTAL billed                   $   52.5000
+
+cross-check  actual=$35.0000  rate-card=$4.1382  (rate-card is 0.12x actual)
+
+ATTRIBUTION SOURCE
+--------------------------------------------------------------------
+  timeline      380.0K   55.2%  hook timeline (mid-session switches attributed)
+  wrapper       300.0K   43.6%  wrapper launch tag only (no timeline for that session)
+  absent          8.5K    1.2%  no repo attribute at all -> session bypassed the wrapper
+
+⚠  UNATTRIBUTED usage -> 'unknown' bucket, not tied to any repo.
+   'no_remote' = ran outside a git repo (genuinely unbillable).
+   'absent'    = no repo tag arrived; the session never passed
+                 through the wrapper (non-CLI surface, or a bad
+                 install). That usage IS billable but unattributed.

@@ -27,14 +27,22 @@ Resolution is therefore done at QUERY time, not ingest time. The stored
 
 Fallback chain, most to least trustworthy:
 
-    timeline   the hook told us where the session was at that moment
-    wrapper    no timeline for this session; use the launch-time repo= tag
-    no_remote  wrapper ran but the directory had no git remote (unbillable)
-    absent     no repo attribute arrived at all — the session never passed
-               through the wrapper (non-CLI surface, or a bypassed install)
+    timeline        the hook told us where the session was at that moment
+    desktop-scratch  a desktop (transcript-sourced) session that has NO
+                     billable repo -- the session's own timeline entries
+                     (if any) all carry repo='unknown', so there is nothing
+                     for the timeline branch to bill to. Distinguished from
+                     `no_remote`/`absent` because it is diagnostic of the
+                     desktop surface specifically, not the OTLP wrapper path.
+    wrapper         no timeline for this session; use the launch-time repo= tag
+    no_remote       wrapper ran but the directory had no git remote (unbillable)
+    absent          no repo attribute arrived at all — the session never
+                     passed through the wrapper (non-CLI surface, or a
+                     bypassed install)
 
-`no_remote` and `absent` both normalize to the 'unknown' repo but mean very
-different things operationally, so they're reported separately.
+`no_remote`, `absent`, and `desktop-scratch` all normalize to the 'unknown'
+repo but mean very different things operationally, so they're reported
+separately.
 """
 
 from __future__ import annotations
@@ -62,10 +70,24 @@ def resolved_repo(alias: str = "t") -> str:
 
 
 def attribution_source(alias: str = "t") -> str:
-    """SQL expression: which signal produced the repo (see module docstring)."""
+    """SQL expression: which signal produced the repo (see module docstring).
+
+    `desktop-scratch` is checked FIRST, ahead of `timeline`: a desktop
+    (transcript-sourced) session that never left a scratch directory still
+    gets a timeline row (claude-repo-tag.py fires on SessionStart), but that
+    row carries repo='unknown' -- so `resolved_repo()` also comes back
+    'unknown' for it. If the timeline branch below were allowed to claim the
+    row first (it matches on ANY timeline row, billable or not), a scratch
+    session would misreport as 'timeline' despite billing nowhere. Keying on
+    `usage_source = 'transcript'` (present on BOTH token_usage and
+    cost_usage) rather than `entrypoint` (token_usage only) keeps this branch
+    safe to prepare against cost_usage too.
+    """
     f = {"tl": TIMELINE_TABLE, "a": alias}
     return (
-        f"CASE WHEN {_AS_OF.format(**f)} IS NOT NULL "
+        f"CASE WHEN {alias}.usage_source = 'transcript' "
+        f"       AND {resolved_repo(alias)} = 'unknown' THEN 'desktop-scratch' "
+        f"     WHEN {_AS_OF.format(**f)} IS NOT NULL "
         f"       OR {_FIRST.format(**f)} IS NOT NULL THEN 'timeline' "
         f"     WHEN {alias}.repo_raw = '' THEN 'absent' "
         f"     WHEN {alias}.repo = 'unknown' THEN 'no_remote' "
@@ -77,7 +99,7 @@ def resolved_view(table: str, alias: str = "t") -> str:
     """A SELECT over token_usage / cost_usage with two columns added:
 
         resolved_repo       the repo to bill (use this instead of `repo`)
-        attribution_source  timeline | wrapper | no_remote | absent
+        attribution_source  timeline | desktop-scratch | wrapper | no_remote | absent
 
     The original `repo` / `repo_raw` columns are preserved so the wrapper's
     launch-time tag stays available for reconciliation.

@@ -18,7 +18,7 @@ clean every surface is.
 
 This project has three user-facing surfaces: CLI modules, the receiver's HTTP
 endpoints, and the generated billing artifacts. There is no web UI — a QA report
-claiming to have checked one is itself a defect.
+claiming to have checked one is itself a defect, so no web-UI criteria are kept below.
 
 ### CLI / command surfaces
 - Exact invocation shown; output is what a user would expect and understand.
@@ -32,8 +32,8 @@ claiming to have checked one is itself a defect.
 - Windows console safety: output must not raise `UnicodeEncodeError` under cp1252.
 
 ### API surfaces (the receiver)
-- `POST /v1/metrics` and `POST /v1/session-repo` both respond; neither 5xx's under
-  normal input.
+- `POST /v1/metrics`, `POST /v1/session-repo`, and `POST /v1/transcript-usage` all
+  respond; neither 5xx's under normal input.
 - With `RECEIVER_AUTH_TOKEN` set, an unauthenticated or wrong-token POST gets 401 —
   a 200 there is a billing-integrity failure, not a minor issue.
 - A malformed body gets 400, not a traceback and not a 500.
@@ -49,10 +49,6 @@ claiming to have checked one is itself a defect.
 - Regeneration overwrites in full rather than appending duplicates; row counts
   reconcile against the store.
 - No secret, token, or credential appears in any generated artifact.
-
-### Web UI surfaces
-- Screenshots show the affected views rendering correctly.
-- Browser console is free of errors; network log shows no failed requests.
 
 ## Cross-cutting checks
 

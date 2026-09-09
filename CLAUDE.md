@@ -14,3 +14,7 @@ Feature work runs through the orchestrator/worker/evaluator system — see
 - **Never commit a secret.** `RECEIVER_AUTH_TOKEN`, `ANTHROPIC_ANALYTICS_TOKEN`, the
   fleet billing token, and every `AZURE_*`/`ADLS_*` value live in `.env` only.
 - `README.md` is ground truth. When code and README disagree, correct the README.
+## Orchestration
+Feature work runs through the orchestrator/worker/evaluator system — see
+.claude/ORCHESTRATION.md. Start features with /feature.
+<!-- orchestration-kit:pointer -->

@@ -5,24 +5,29 @@
 > MDM. See [`../client-package/ADMIN.md`](../client-package/ADMIN.md). This
 > document is the *enforced* fleet-wide track.
 
-**Three artifacts** get pushed to every developer machine. **All three are
+**Four artifacts** get pushed to every developer machine. **All four are
 required** — one turns telemetry on, one tags it with the repo at launch, one
-keeps that tag correct as the developer moves between repos.
+keeps that tag correct as the developer moves between repos, and one recovers
+desktop-app usage the other three can't see at all.
 
 | File | Job | Nature |
 |---|---|---|
-| `managed-settings.json` | Turn telemetry **ON** (enforced), point it at the billing receiver, carry the fleet token, register the hook | **Static** — same on every machine |
+| `managed-settings.json` | Turn telemetry **ON** (enforced), point it at the billing receiver, carry the fleet token, register both hooks | **Static** — same on every machine |
 | `claude-wrapper.sh` | Tag each session with `repo=<git remote>` at launch | **Dynamic** — computed per session (see that file) |
 | `claude-repo-tag.py` | Record repo changes **during** a session (hook) | **Dynamic** — fires on every `cd` |
+| `claude-transcript-usage.py` | Ship desktop-app usage recovered from on-disk transcripts (hook) | **Dynamic** — fires on `SessionEnd` only |
 
 Skipping any one of them fails in its own way:
 
 - **No wrapper** → sessions emit usage with no repo tag; it all lands in the
   `unknown` bucket, unattributable. Settings-only looks like success while being
   entirely unbillable.
-- **No hook** → a session that starts in one client's repo and `cd`s into
-  another's bills *all* of it to the first. That is worse than missing data,
-  because it is confidently wrong.
+- **No repo-tag hook** → a session that starts in one client's repo and `cd`s
+  into another's bills *all* of it to the first. That is worse than missing
+  data, because it is confidently wrong.
+- **No transcript hook** → the desktop app's usage — which has no OTLP exporter
+  at all — never reaches the receiver, so it bills to nobody, with nothing
+  reporting the gap.
 
 ## Setup checklist
 
@@ -34,8 +39,9 @@ Work top to bottom; each step has its own section below.
 4. [ ] Push `managed-settings.json` to the system path for the OS (§1).
 5. [ ] Install the real binary at `/opt/cyclotron/claude-real`, push `claude-wrapper.sh` as the only `claude` on PATH, pin `CLAUDE_REAL_BIN` **in the shell environment** (§2).
 6. [ ] Push `claude-repo-tag.py` to `/opt/cyclotron/claude-repo-tag.py`, `chmod +x`, path matching what the settings file registers (§3).
-7. [ ] Verify on one machine before the next wave — each section has a Verify block.
-8. [ ] Once stable, restart the receiver with `--require-auth` so it can't silently reopen (§4).
+7. [ ] Push `claude-transcript-usage.py` to `/opt/cyclotron/claude-transcript-usage.py`, `chmod +x`, path matching its `SessionEnd`-only registration in the settings file (§3a).
+8. [ ] Verify on one machine before the next wave — each section has a Verify block.
+9. [ ] Once stable, restart the receiver with `--require-auth` so it can't silently reopen (§4).
 
 ## 1. managed-settings.json
 
@@ -247,6 +253,73 @@ session, so you can see how much of the bill each signal is carrying.
 
 ---
 
+## 3a. claude-transcript-usage.py (desktop-app usage)
+
+The Claude Code **desktop app has no OTLP exporter** — telemetry export is a
+CLI-only capability (the VS Code extension only bills because it spawns the CLI
+underneath), and no `managed-settings.json` env can fix that: there is nothing
+on the desktop side for it to configure. Every token spent in the desktop app
+would otherwise bill to nobody, invisibly.
+
+The fix is a second, standalone hook that recovers usage from the transcripts
+Claude Code already writes to disk (`~/.claude/projects/**/*.jsonl`) and ships
+it to the same receiver over `POST /v1/transcript-usage`. It walks the projects
+tree **recursively** — never just the `transcript_path` it's handed on stdin —
+because subagent (sidechain) usage lives one level deeper
+(`<project_dir>/<sessionId>/subagents/agent-<agentId>.jsonl`) and a crashed
+desktop session's `SessionEnd` never fires for it, so only a later session's
+hook run can ever reach it. Rows sharing an API request are cumulative
+streaming snapshots — the hook collapses each request to its terminal block
+client-side before shipping, so a request is never summed (over-bills) or taken
+from its first snapshot (under-bills).
+
+Unlike `claude-repo-tag.py`, which registers on five events, this hook is
+registered on **`SessionEnd` only** — it does real work (a recursive transcript
+sweep, not a small POST per firing) and a catch-up sweep on the next
+`SessionEnd` is what recovers a session whose own `SessionEnd` never fired.
+
+Ships no message content, prompt, tool output, or file path (`cwd` is
+deliberately excluded from the wire payload) — only usage metadata: token
+counts, model, timestamp, request id, and the git remote resolved client-side.
+
+### Install
+
+1. Push `claude-transcript-usage.py` to a fixed path, e.g.
+   `/opt/cyclotron/claude-transcript-usage.py`, and mark it executable
+   (`chmod +x`).
+2. Register it under `hooks.SessionEnd` in `managed-settings.json` (already
+   wired in this repo's copy, alongside `claude-repo-tag.py`'s own `SessionEnd`
+   entry) so it's enforced org-wide.
+3. Point it at the receiver with `CLAUDE_BILLING_RECEIVER` and
+   `CLAUDE_BILLING_TOKEN` — same env keys `claude-repo-tag.py` uses.
+
+**Requires `python3` on the PATH** (stdlib only — no pip installs). Same
+never-break-a-session design as `claude-repo-tag.py`: always exits 0, short
+network timeout, failures swallowed. A transport failure (receiver unreachable)
+retries indefinitely on the next hook run and never drops data; a 400 (schema
+defect) or a per-record rejection is retried up to a bounded number of times
+before that one record is dropped and logged locally — never a whole batch for
+one bad record.
+
+### Verify on a machine
+
+```
+# fire the hook by hand (it reads hook JSON from stdin, same shape Claude Code sends)
+echo '{"session_id":"test-1","hook_event_name":"SessionEnd"}' \
+  | CLAUDE_BILLING_RECEIVER=http://127.0.0.1:4318 /opt/cyclotron/claude-transcript-usage.py
+echo "exit=$?"   # MUST be 0
+
+# server side: desktop-sourced rows landed
+sqlite3 ./otel-data/otel.db \
+  "SELECT session_id, model, token_type, tokens, usage_source, entrypoint FROM token_usage WHERE usage_source='transcript' ORDER BY ts DESC LIMIT 5;"
+```
+
+`python -m billing.otel.bill` labels the mix of `actual` (OTLP) vs `rate_card`
+(desktop, estimated) cost, and reports a `desktop-scratch` attribution bucket
+for desktop sessions with no billable repo.
+
+---
+
 ## 4. Hosting the receiver (server side)
 
 The receiver is the endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` points at. It must run
@@ -260,8 +333,9 @@ docker compose logs receiver     # must print: auth=ENABLED
 ```
 
 - Listens on `:4318` for OTLP/JSON; captures `claude_code.token.usage` and
-  `claude_code.cost.usage`, tagged with the repo. Also accepts the hook's
-  `POST /v1/session-repo`.
+  `claude_code.cost.usage`, tagged with the repo. Also accepts the repo-tag
+  hook's `POST /v1/session-repo` and the transcript hook's batched
+  `POST /v1/transcript-usage` (desktop-app usage).
 - SQLite store + request log persist in `./otel-data` on the host.
 - Stdlib-only image (no dependencies).
 

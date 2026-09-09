@@ -25,8 +25,8 @@ never code**.
    already-accurate prose **verbatim**. Prefer surgical edits over rewrites; a
    justified no-op for an already-correct doc is a valid outcome.
 5. **HISTORICAL LOGS.** Dated notes under `_research/` are append/annotate territory,
-   not rewrite-history. Promote only implemented ground truth into `README.md`.
-6. **DISTRIBUTABLE ARCHIVES ARE NOT DOCS.** `client-package.zip` and
+   not rewrite-history. Promote only implemented ground truth into README.md.
+**DISTRIBUTABLE ARCHIVES ARE NOT DOCS.** `client-package.zip` and
    `pilot-package.zip` are build outputs of `client-package/build.py`, not
    documentation. Never edit or regenerate them here; if a doc change implies the
    archive is stale, say so in the report and stop.
@@ -34,8 +34,11 @@ never code**.
 ## Documentation surface map
 
 In scope: **everything markdown EXCEPT `_research/` and `_goals/`** — READMEs, docs
-under `docs/`, per-directory instruction files, and `.claude`
+under `docs/`, per-directory instruction files, and `.claude/`
 skill/agent files.
+
+In scope: **everything markdown EXCEPT `_research/` and `_goals/`** — READMEs, docs
+under `docs/`, per-directory instruction files, and `.claude` skill/agent files.
 
 This project has five doc buckets and one canonical reference. `README.md` is the
 ground truth: it documents every module by name, the OTEL flow, the SQLite
@@ -82,12 +85,18 @@ shipped"** fact list — new/changed routes, modules, CLIs, config keys, UI surf
 auth behavior, renames, removals — each fact with its source file.
 
 ### Phase 6.2: Map changes to affected docs
-Using the surface map above, list in-scope docs that plausibly mention each shipped
-fact, then **grep those docs** for stale claims (old names, removed flags, "TODO",
-"planned", "not yet"). Produce a **per-doc edit list** (or "no change — already
-accurate"). Confirm `_research/` and `_goals/` are excluded.
+Using the surface map above, (1) **grep every in-scope doc** for each shipped fact's
+identifiers — old and new names, flags, paths, and stale markers ("TODO", "planned",
+"not yet"); (2) build the **per-doc edit list** from ONLY docs with at least one hit.
+A doc with zero hits is out of the edit list — it is not evaluated and not reported as
+"already accurate". Confirm `_research/` and `_goals/` are excluded.
 
 ### Phase 6.3: Evaluate the edit plan (`evaluator`)
+**Small-change fold.** When the edit list has ≤ 3 docs, skip 6.3 as a separate spawn:
+execute 6.4 directly and have the 6.5 final audit ALSO verify the edit-list criteria
+(coverage, scope, anti-invention) in the same spawn. Log 'Phase 6.3 folded into 6.5
+(edit list ≤ 3)'. With > 3 docs, 6.3 runs as today.
+
 Criteria: coverage (every stale doc caught?), scope (zero excluded-path or code edits
 planned?), anti-invention (every planned edit cites its source file?). Mandatory
 re-evaluate loop: PASS → 6.4; NEEDS REVISION → revise + re-evaluate (3 max); REJECT →
@@ -101,9 +110,11 @@ preserved prose intact, links resolve. Re-evaluate loop, 3 cycles max per doc.
 
 ### Phase 6.5: Final audit (`evaluator`)
 The whole change set: every affected doc accurate and **mutually consistent**; no
-stale claims remain; `git status` shows **only** documentation files changed.
-APPROVED → lint markdown if a linter is configured, report which docs changed (and
-which were already accurate); ISSUES → remediate + re-audit (3 max).
+stale claims remain; `git status` shows **only** documentation files changed. When the
+small-change fold applied, this audit also verifies the 6.3 edit-list criteria (coverage,
+scope, anti-invention).
+APPROVED → lint markdown if a linter is configured, report which docs changed; ISSUES →
+remediate + re-audit (3 max).
 
 ## Escalation
 

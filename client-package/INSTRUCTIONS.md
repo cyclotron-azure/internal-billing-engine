@@ -72,17 +72,28 @@ Per Claude Code session, the receiver records:
 - the **git remote** of the repo you are working in (e.g. `github.com/cyclotron-azure/acme-web`)
 - the **model**, **token counts**, and **cost** of the usage
 - your **work email**, a **session id**, and **timestamps**
+- for desktop-app usage specifically, that it came from the desktop app, and whether
+  the record came from a **subagent**
+- your Claude account's **user id** and **org id** — the identifiers your Claude
+  account profile already carries, not anything read off your machine's credentials
 
 It does **not** collect your prompts, your code, file contents, or file paths.
-None of that is in Claude Code's telemetry, and this ships metrics only — event
-logs are not exported.
+That is a fixed scope, not a promise about what happens to be exported today: the
+desktop-usage hook does not read Claude Code's telemetry at all — it reads the
+transcript files Claude Code writes under your Claude config directory
+(`~/.claude/projects` by default), and it sends only usage metadata drawn from a
+fixed 14-field wire schema. Nothing outside that schema — no message content, no
+prompt text, no tool output, no file path — is ever transmitted. Because the files
+are on your own disk, you can check this claim yourself rather than take it on
+trust.
 
 Your usage is visible to whoever administers billing. If that matters to you,
 raise it before installing rather than after.
 
 ### What the installer does
 
-1. copies the repo-tag hook to `~/.cyclotron/claude-repo-tag.py`
+1. copies the repo-tag hook and the desktop-usage hook to `~/.cyclotron/claude-repo-tag.py`
+   and `~/.cyclotron/claude-transcript-usage.py`
 2. **merges** the telemetry settings into your `~/.claude/settings.json`, keeping
    everything already in it — your permissions, theme, and any other hooks are
    preserved, and a timestamped `.bak-…` backup is written first
@@ -109,7 +120,7 @@ if your usage stops showing up.
 
 Double-click **`Uninstall.command`** (macOS) or **`Uninstall.bat`** (Windows).
 
-That removes the hook file and only the settings this installer added — your own
+That removes both hook files and only the settings this installer added — your own
 settings stay. Telemetry stops with your next session.
 
 ## Keep this folder

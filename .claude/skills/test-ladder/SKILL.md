@@ -70,17 +70,17 @@ package.
 |--------------|----------------------|
 | `billing/otel/<module>.py` | `tests/test_<module>.py` |
 | `billing/<module>.py` | `tests/test_<module>.py` |
-| `billing/otel/otel_store.py` | `tests/test_otel_store.py` **plus** every test that opens a store — `attribute`, `bill`, `invoice`, `export`, `receiver` |
+| `billing/otel/otel_store.py` | `tests/test_otel_store.py` **plus** every test that opens a store — `attribute`, `bill`, `invoice`, `export`, `receiver`, `integration_desktop` |
 | `billing/otel/normalize.py` | `tests/test_normalize.py` **plus** `test_attribute.py`, `test_bill.py` (repo keys flow through both) |
 | `billing/otel/attribute.py` | `tests/test_attribute.py` **plus** `test_bill.py`, `test_invoice.py` |
 | `billing/config.py` | any test that reads configuration — grep for `config` in `tests/` |
-| `deploy/**`, `client-package/**` | `tests/test_configure.py` if present; otherwise rung 2 is a no-op and the change is verified through the QA gate instead |
+| `deploy/**`, `client-package/**` | `tests/test_transcript_hook.py` **and** `tests/test_configure.py` — the former is the only coverage of `deploy/claude-transcript-usage.py`'s always-exit-0 discipline, an auto-fail trigger, so it runs even for a `client-package/**`-only change (that hook is mirrored into `client-package/`) |
 
 Command forms:
 
 ```bash
 python -m pytest tests/test_attribute.py -v          # rung 1 — one file
-python -m pytest tests/test_attribute.py::test_asof -v   # rung 1 — one test
+python -m pytest tests/test_attribute.py::test_bill_py_runs_against_otlp_only_store -v   # rung 1 — one test
 python -m pytest tests/test_attribute.py tests/test_bill.py -v   # rung 2 — impacted set
 ```
 

@@ -47,12 +47,27 @@ import time
 import urllib.error
 import urllib.request
 
-HOOK_NAME = "claude-repo-tag.py"
 CONFIG_NAME = "billing-config.json"
-HOOK_EVENTS = ("SessionStart", "CwdChanged", "DirectoryAdded", "SessionEnd",
-               "UserPromptSubmit")
+
+# Every hook this installer manages, and the event set each is registered on.
+# claude-repo-tag.py keeps all five events, unchanged from before the second
+# hook existed. claude-transcript-usage.py is SessionEnd ONLY: it walks the
+# transcript tree for unshipped usage, and registering that walk on
+# UserPromptSubmit would run a full transcript sweep on every prompt -
+# precisely the latency ASYNC_EVENTS below exists to keep off the critical
+# path. Generalizing this to a per-hook map (instead of one shared tuple) is
+# what makes that distinction expressible at all.
+HOOK_EVENTS_BY_FILE = {
+    "claude-repo-tag.py": ("SessionStart", "CwdChanged", "DirectoryAdded",
+                           "SessionEnd", "UserPromptSubmit"),
+    "claude-transcript-usage.py": ("SessionEnd",),
+}
+HOOK_FILES = tuple(HOOK_EVENTS_BY_FILE.keys())
+
 # UserPromptSubmit re-tags on every prompt so a single missed delivery
-# self-heals; async so a slow receiver never adds latency to a prompt.
+# self-heals; async so a slow receiver never adds latency to a prompt. Only
+# claude-repo-tag.py is ever registered on this event, so in practice this
+# applies to it alone.
 ASYNC_EVENTS = frozenset({"UserPromptSubmit"})
 
 # Env keys this installer owns. Uninstall removes exactly these and nothing else.
@@ -143,8 +158,8 @@ def hook_dir() -> str:
     return os.path.join(home(), ".cyclotron")
 
 
-def hook_path() -> str:
-    return os.path.join(hook_dir(), HOOK_NAME)
+def hook_path(hook_name: str) -> str:
+    return os.path.join(hook_dir(), hook_name)
 
 
 def interpreter() -> str:
@@ -166,13 +181,13 @@ def interpreter() -> str:
     return exe
 
 
-def hook_command() -> str:
+def hook_command(hook_name: str) -> str:
     """Shell command Claude Code runs for each hook event.
 
     Both paths are quoted: a Windows profile directory or a macOS home can
     contain spaces, and Claude Code passes this string to a shell.
     """
-    return '"%s" "%s"' % (interpreter(), hook_path())
+    return '"%s" "%s"' % (interpreter(), hook_path(hook_name))
 
 
 # --------------------------------------------------------------------------
@@ -343,17 +358,22 @@ def apply_config(obj: dict, endpoint: str, token: str) -> dict:
     hooks = obj.get("hooks")
     if not isinstance(hooks, dict):
         hooks = {}
-    strip_our_hooks(hooks, hook_path())
-    cmd = hook_command()
-    for event in HOOK_EVENTS:
-        entry = {"type": "command", "command": cmd}
-        if event in ASYNC_EVENTS:
-            entry["async"] = True
-        groups = hooks.get(event)
-        if not isinstance(groups, list):
-            groups = []
-        groups.append({"hooks": [entry]})
-        hooks[event] = groups
+    # Strip both hooks' prior entries first (idempotent re-install), THEN
+    # register each on its own event set - a hook removed from one machine's
+    # settings must never leave the other hook's entries behind either.
+    for hook_name in HOOK_FILES:
+        strip_our_hooks(hooks, hook_path(hook_name))
+    for hook_name, events in HOOK_EVENTS_BY_FILE.items():
+        cmd = hook_command(hook_name)
+        for event in events:
+            entry = {"type": "command", "command": cmd}
+            if event in ASYNC_EVENTS:
+                entry["async"] = True
+            groups = hooks.get(event)
+            if not isinstance(groups, list):
+                groups = []
+            groups.append({"hooks": [entry]})
+            hooks[event] = groups
     obj["hooks"] = hooks
     return obj
 
@@ -395,6 +415,50 @@ def verify(endpoint: str, token: str, timeout: float = 5.0) -> bool:
         return False
 
 
+def verify_hooks_installed() -> bool:
+    """Confirm BOTH hooks are registered on their correct event set and their
+    files exist on disk. Static check only - never runs a hook, never
+    contacts the receiver.
+
+    Extends `cmd_verify`, which previously checked only receiver reachability
+    and no hook registration at all.
+    """
+    ok = True
+    obj, existed = read_settings(settings_path())
+    hooks = obj.get("hooks") if existed else {}
+    if not isinstance(hooks, dict):
+        hooks = {}
+    for hook_name, expected_events in HOOK_EVENTS_BY_FILE.items():
+        dest = hook_path(hook_name)
+        if not os.path.exists(dest):
+            print("  [FAIL] %s is not installed (expected at %s)" % (hook_name, dest))
+            ok = False
+            continue
+        needle = hook_name.lower()
+        registered = set()
+        for event, groups in hooks.items():
+            if not isinstance(groups, list):
+                continue
+            for group in groups:
+                inner = (group or {}).get("hooks") if isinstance(group, dict) else None
+                if not isinstance(inner, list):
+                    continue
+                for h in inner:
+                    cmd = (h or {}).get("command", "") if isinstance(h, dict) else ""
+                    if needle in str(cmd).replace("\\", "/").lower():
+                        registered.add(event)
+        missing = set(expected_events) - registered
+        extra = registered - set(expected_events)
+        if missing:
+            print("  [FAIL] %s missing from event(s): %s" % (hook_name, ", ".join(sorted(missing))))
+            ok = False
+        elif extra:
+            print("  [WARN] %s also registered on unexpected event(s): %s" % (hook_name, ", ".join(sorted(extra))))
+        else:
+            print("  [ok]   %s registered on %s" % (hook_name, ", ".join(expected_events)))
+    return ok
+
+
 # --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
@@ -413,9 +477,12 @@ def cmd_install(args) -> int:
         confirm_or_exit()
         print("")
 
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), HOOK_NAME)
-    if not os.path.exists(src):
-        raise SystemExit("Cannot find %s next to this script - is the package intact?" % HOOK_NAME)
+    srcs = {}
+    for hook_name in HOOK_FILES:
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), hook_name)
+        if not os.path.exists(src):
+            raise SystemExit("Cannot find %s next to this script - is the package intact?" % hook_name)
+        srcs[hook_name] = src
 
     print("Claude Code usage-billing client - install")
     print("  platform    %s (%s)" % (platform.system(), platform.machine()))
@@ -423,7 +490,8 @@ def cmd_install(args) -> int:
     print("  endpoint    %s%s" % (endpoint, "   [INSECURE]" if endpoint.startswith("http://") else ""))
     print("  token       %s" % mask(token))
     print("  settings    %s" % settings_path())
-    print("  hook        %s" % hook_path())
+    for hook_name in HOOK_FILES:
+        print("  hook        %s" % hook_path(hook_name))
     if cfg and not (args.endpoint and args.token):
         print("  source      %s (baked into this package)" % CONFIG_NAME)
 
@@ -432,11 +500,13 @@ def cmd_install(args) -> int:
         return 0
 
     os.makedirs(hook_dir(), exist_ok=True)
-    shutil.copy2(src, hook_path())
-    if os.name == "posix":
-        st = os.stat(hook_path())
-        os.chmod(hook_path(), st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    print("\n  copied hook -> %s" % hook_path())
+    for hook_name, src in srcs.items():
+        dest = hook_path(hook_name)
+        shutil.copy2(src, dest)
+        if os.name == "posix":
+            st = os.stat(dest)
+            os.chmod(dest, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        print("\n  copied hook -> %s" % dest)
 
     path = settings_path()
     obj, existed = read_settings(path)
@@ -488,7 +558,8 @@ def cmd_uninstall(args) -> int:
         hooks = obj.get("hooks")
         removed_hooks = 0
         if isinstance(hooks, dict):
-            removed_hooks = strip_our_hooks(hooks, hook_path())
+            for hook_name in HOOK_FILES:
+                removed_hooks += strip_our_hooks(hooks, hook_path(hook_name))
             if not hooks:
                 obj.pop("hooks", None)
         print("  removed %d env keys, %d hook entries" % (len(removed_env), removed_hooks))
@@ -500,16 +571,18 @@ def cmd_uninstall(args) -> int:
     else:
         print("  no %s - nothing to clean" % path)
 
-    if os.path.exists(hook_path()):
-        if not args.dry_run:
-            os.remove(hook_path())
-        print("  removed hook %s" % hook_path())
-        try:
-            if not args.dry_run and not os.listdir(hook_dir()):
-                os.rmdir(hook_dir())
-                print("  removed empty %s" % hook_dir())
-        except OSError:
-            pass
+    for hook_name in HOOK_FILES:
+        dest = hook_path(hook_name)
+        if os.path.exists(dest):
+            if not args.dry_run:
+                os.remove(dest)
+            print("  removed hook %s" % dest)
+    try:
+        if not args.dry_run and os.path.isdir(hook_dir()) and not os.listdir(hook_dir()):
+            os.rmdir(hook_dir())
+            print("  removed empty %s" % hook_dir())
+    except OSError:
+        pass
 
     if args.dry_run:
         print("\n--dry-run: nothing written.")
@@ -536,8 +609,12 @@ def cmd_verify(args) -> int:
                     "No --token given, none in settings.json, and no %s in this "
                     "package." % CONFIG_NAME)
             print("Using token baked into this package (%s)" % CONFIG_NAME)
+    print("Checking installed hooks:")
+    hooks_ok = verify_hooks_installed()
+
     print("Verifying %s with token %s:" % (endpoint, mask(token)))
-    return 0 if verify(endpoint, token) else 1
+    receiver_ok = verify(endpoint, token)
+    return 0 if (hooks_ok and receiver_ok) else 1
 
 
 def main() -> int:

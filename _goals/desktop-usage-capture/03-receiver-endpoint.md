@@ -43,6 +43,27 @@ eval_depth: full
       (not a list, oversized) returns 400. Rationale: the hook drops a batch after its retry bound, so
       whole-batch rejection means one malformed record silently discards a full batch of billable
       records.
+- [ ] **A store `ValueError` must NOT escape the per-record loop.** Task 01 froze a contract where
+      `insert_datapoint` / `insert_cost_datapoint` RAISE `ValueError` when `request_id` is missing on a
+      non-OTLP call, or when `request_id` is passed on an OTLP call. Both are wiring-bug guards, and
+      raising is deliberate — it converts a silent 90.5% under-bill into a loud failure. But an escaped
+      raise inside your per-record loop would abort the whole batch and return 400, discarding the valid
+      records alongside the bad one and violating AC 3b directly. Catch it per record, count it as a
+      rejection with its reason, and continue.
+      **Catch `ValueError` around BOTH `map_record` AND the store insert, per record — not only the
+      store.** An earlier draft of this requirement claimed the store guard was "unreachable from client
+      data because `transcript.py` rejects the record first". That claim was FALSE when written and is
+      recorded here as a correction: task 02's validator did not parse `ts`, so a record with
+      `ts="garbage"` passed validation and `map_record`'s `datetime.fromisoformat` raised instead. Task
+      02 has since added `invalid_ts` per-record validation, which closes that specific hole — but do
+      not rebuild this requirement on the assumption that validation is exhaustive. Any raise escaping
+      your per-record loop reaches `receiver.py:261`/`:274`'s `except (ValueError, KeyError)` and
+      returns **400 for the whole batch**; task 06 then retries, exhausts its bound, and drops a full
+      batch of valid billable records. That is the batch-poisoning path per-record rejection exists to
+      prevent, and it defeats AC 3b.
+      Verified: `receiver.py:261` and `:274` already catch `(ValueError, KeyError)` and answer 400, so a
+      raise lands on the existing 400 path rather than a 500 — the problem is the BLAST RADIUS, not the
+      status code.
 - [ ] The 200 body's reject entries identify records by `request_id` and reason — never by echoing
       record content.
 - [ ] **Identity is persisted.** `user_email`, `user_id`, and `org_id` from each record are passed

@@ -47,6 +47,18 @@ Two running Delta tables, queryable from the SQL endpoint / Power BI:
 grained by it, so a repo with several developers now yields one row per developer
 — aggregate it away in the semantic model to get the per-repo billing total.
 
+> ⚠️ **`actual_cost_usd` mixes Anthropic-reported actuals with rate-card
+> estimates, and neither table tells you which is which.** Desktop-app usage
+> (captured via the `desktop-usage-capture` goal) is billed from a placeholder
+> rate card rather than an Anthropic-reported cost, and those estimated dollars
+> land in the same `actual_cost_usd` column as genuine OTLP actuals — **no
+> column in `claudeusagesummary` or `claudeusagelineitems` distinguishes an
+> estimated row from an actual one.** This is a deliberate, known deferral, not
+> an oversight: surfacing a `cost_source` column here was pinned Out of Scope
+> for that goal (see its goal.md), which calls it "the clearest known gap this
+> goal leaves open." There is no `cost_source` column today and none is
+> committed to on any timeline.
+
 ### The date columns
 
 - **`usage_date_utc`** — the UTC day the usage actually happened. This is the finest

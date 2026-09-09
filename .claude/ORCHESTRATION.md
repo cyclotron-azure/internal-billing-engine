@@ -1,20 +1,14 @@
 # internal-billing-engine Orchestration Architecture
 
-A guide to how the feature orchestration system works for **internal-billing-engine**,
+A guide to how the feature and research orchestration system works for **internal-billing-engine**,
 including subagent delegation, evaluation cycles, and retry mechanisms.
 
-> **Stack note:** Python 3.10+ with **no third-party runtime dependencies** — the
-> standard library only, by design; there is nothing to `pip install` to run the engine,
-> and the `Dockerfile` reflects that. The `billing/` package holds two ingest pipelines
-> that converge only at `reconcile.py`: the OTEL repo-level path (`billing/otel/` — an
-> OTLP/JSON receiver, query-time repo attribution, rating, invoicing, and CSV export to
-> ADLS Gen2 / OneLake for Microsoft Fabric) and the Anthropic Analytics per-user path
-> (`analytics_client.py` → `ingest.py` → `store.py` → `report.py`). Persistence is a
-> single-host, single-connection SQLite store — an architectural constraint that shapes
-> the whole deployment, not an implementation detail. Two client-rollout tracks install
-> the same telemetry hook: `deploy/` (MDM-enforced) and `client-package/` (opt-in,
-> double-click). Tests are `pytest` under `tests/` — the one dev dependency — and the
-> canonical domain reference is `README.md`.
+> **Stack note:** Python 3.10+ with **no third-party runtime dependencies** — the standard library only, by design; there is nothing to `pip install` to run the engine, and the `Dockerfile` reflects that. The `billing/` package holds two ingest pipelines that converge only at `reconcile.py`: the OTEL repo-level path (`billing/otel/` — an OTLP/JSON receiver, query-time repo attribution, rating, invoicing, and CSV export to ADLS Gen2 / OneLake for Microsoft Fabric) and the Anthropic Analytics per-user path (`analytics_client.py` → `ingest.py` → `store.py` → `report.py`). Persistence is a single-host, single-connection SQLite store — an architectural constraint that shapes the whole deployment, not an implementation detail.
+Two client-rollout tracks install the same two telemetry hooks (`claude-repo-tag.py`
+> and `claude-transcript-usage.py`): `deploy/` (MDM-enforced) and `client-package/`
+> (opt-in, double-click). Tests are `pytest` under `tests/` — the one dev dependency —
+> and the canonical domain reference is `README.md`.
+
 
 ---
 
@@ -23,11 +17,12 @@ including subagent delegation, evaluation cycles, and retry mechanisms.
 1. [Core Concepts](#core-concepts)
 2. [Component Overview](#component-overview)
 3. [Feature Flow](#feature-flow)
-4. [QA Evaluation (Optional Behavioral Gate)](#qa-evaluation-optional-behavioral-gate)
-5. [Subagent Communication Protocol](#subagent-communication-protocol)
-6. [Evaluation & Retry Mechanisms](#evaluation--retry-mechanisms)
-7. [Autonomous Loop](#autonomous-loop)
-8. [Quick Reference](#quick-reference)
+4. [Research Flow](#research-flow)
+5. [QA Evaluation (Optional Behavioral Gate)](#qa-evaluation-optional-behavioral-gate)
+6. [Subagent Communication Protocol](#subagent-communication-protocol)
+7. [Evaluation & Retry Mechanisms](#evaluation--retry-mechanisms)
+8. [Autonomous Loop (Optional)](#autonomous-loop-optional)
+9. [Quick Reference](#quick-reference)
 
 ---
 
@@ -74,6 +69,10 @@ Each subagent invocation:
 
 This eliminates fatigue and bias completely.
 
+Exception for re-checks: the evaluator is resumed with a delta prompt listing only
+the applied fixes; the implementer may be resumed for fix cycle 1 only (cycles 2–3
+are fresh spawns). Fresh context remains the rule for first spawns.
+
 ### Subagent Invocation: Retry on Transient Failures
 
 Subagent invocations can fail due to transient issues (network timeouts, rate limits, temporary service unavailability). When this happens:
@@ -99,28 +98,26 @@ ON subagent invocation failure:
 | Skill | Type | Purpose |
 |-------|------|---------|
 | `feature` | Coordinator | Plans and executes feature implementation across internal-billing-engine layers |
+| `research` | Coordinator | Research → Plan workflow for domain topics |
 | `goal-criteria` | Reference | Criteria for goal evaluation |
 | `task-criteria` | Reference | Criteria for task evaluation |
 | `qa-criteria` | Reference | Criteria for user-facing QA evaluation |
 | `test-ladder` | Supporting | New tests → impacted tests mid-cycle; full suites (rung 3) only at cycle end |
 | `align-docs` | Coordinator | Phase 6: evaluator-gated sync of all docs to shipped code (docs-only) |
-| `ship-pr` | Delivery | Phase 7: draft + create the PR/MR on GitHub, or hand over (approval-gated) |
-| `auto-loop` | Coordinator | One unattended iteration of the feature flow, pulling a story from `_goals/backlog.md` |
-> This project has **no domain or supporting skills of its own yet** — the table above
-> is the complete skill set. `README.md` plays the role a domain skill otherwise would;
-> the `feature` skill routes it (and the per-layer reference files listed in its
-> "Supporting skills routing" section) into context packages instead. The `research`
-> skill was not installed for this project.
+| `ship-pr` | Delivery | Phase 7: draft + create the PR/MR on the project's forge, or hand over (approval-gated) |
+| `python-testing-patterns` | Supporting | pytest fixtures, mocking, and TDD patterns (`wshobson/agents`) |
+| `python-performance-optimization` | Supporting | cProfile/memory profiling and Python perf patterns (`wshobson/agents`) |
+| `python-appservice-deploy` | Supporting | Python deploys to Azure App Service Linux — reference only; this engine ships via Docker Compose (`microsoft/azure-skills`) |
 
 > `goal-criteria`, `task-criteria`, `qa-criteria`, `test-ladder`, `align-docs`,
 > `ship-pr`, and `auto-loop` set `disable-model-invocation: true` — they load via
-> `/name` or a cited path, not session-start auto-discovery. `feature` remains
-> auto-invocable.
+> `/name` or a cited path, not session-start auto-discovery. `feature` and
+> `research` remain auto-invocable.
 
-> Supporting references are routed into subagent context packages by `feature` (see its
-> "Supporting skills routing" section) based on which layer a task touches. When this
-> project grows a real domain skill, add it to the table above and to that routing map
-> in the same change.
+> Domain skills are the project's knowledge base — the orchestration skills above
+> reference them but do not replace them. Supporting skills are routed into subagent
+> context packages by `feature` (see its "Supporting skills" section)
+> based on which layer a task touches.
 
 ### Subagents (`.claude/agents/`)
 
@@ -149,12 +146,16 @@ a fraction of the output-token cost. Model IDs are configuration, not constants:
 resolved per-harness model ID for each tier lives in exactly one place, the model map,
 and is pinned into each agent's config from there — on harnesses with a skills tree
 (Claude Code, Cursor) the map is also copied to `.claude/skills/setup-models.map.md`
-for reference. Update the map (and re-pin the agent files) when providers rotate
-names. This install targets **Claude Code only**, where the relevant caveats are that
-`CLAUDE_CODE_SUBAGENT_MODEL` and `CLAUDE_CODE_EFFORT_LEVEL` override frontmatter, and
-that an org `availableModels` allowlist can cause a pin to be ignored silently — check
-the allowlist before assuming a stale ID. Resolved tiers: **frontier** =
-`claude-opus-5`, **light** = `claude-sonnet-5`.
+for reference, while the Copilot and Codex emitters place no reference copy of the map,
+so their pins live only in the harness's own config/frontmatter (Copilot `.agent.md`
+frontmatter, Codex `.codex/agents/<role>.toml`), resolved from the map at setup time;
+update the map (and re-pin) when providers rotate names. Harness caveats: on
+Copilot a subagent cannot run a stronger model than the session (so the session itself
+must run the frontier tier); Cursor silently falls back to a compatible model under
+admin/plan restrictions, and does the same — without erroring — when the resolved ID is
+unknown or stale (evaluators should report which model produced the verdict).
+Every spawn passes its model explicitly; agents self-report the model in their first
+report line.
 
 ---
 
@@ -253,14 +254,18 @@ in dependency order:
   package includes the task file (including its Acceptance Criteria)
 - Step 2: Receive completion report
 - Step 3: Launch evaluator
-- Step 4: Handle verdict — PASS → next task; NEEDS FIXES → fix cycle (model
-  rotation) and re-evaluate, 3 max, then the continuation ladder (rungs 5→4→6 — see
-  Evaluation & Retry Mechanisms) before escalation; REJECT → escalate to the user.
+- Step 4: Handle verdict — PASS or PASS (with notes) → next task (`PASS (with notes)`
+  counts as PASS; copy notes into the orchestration log); NEEDS FIXES → fix cycle (model
+  rotation) and re-evaluate, 3 max, then read `goal.md`'s `phases.ladder`: `auto` → the
+  continuation ladder (rungs 5→4→6 — see Evaluation & Retry Mechanisms) before
+  escalation; `escalate` (default) → escalate to the user with the ladder offered as
+  option 1; REJECT → escalate to the user.
   A verdict tagged with a bypass failure class (destructive/security/infra)
   escalates at detection, on any cycle.
 
-INVARIANT: A task is only marked complete after the evaluator returns PASS. There is
-no path where fixes are made and the orchestrator proceeds without re-verification.
+INVARIANT: A task is only marked complete after the evaluator returns PASS or
+PASS (with notes) (`PASS (with notes)` counts as PASS). There is no path where
+fixes are made and the orchestrator proceeds without re-verification.
 
 **Phase 5 — Final audit (mandatory re-audit loop).** All tasks complete → final
 evaluator audit. APPROVED → Quality Checks (ladder rung 3: full suites, via a
@@ -268,7 +273,8 @@ evaluator audit. APPROVED → Quality Checks (ladder rung 3: full suites, via a
 INVARIANT: The ONLY exit to Quality Checks is an APPROVED verdict from the audit
 subagent. Remediations MUST be re-audited.
 
-**Phase 6 — Align docs (evaluator-gated doc sync, optional).** After Phase 5 Quality
+**Phase 6 — Align docs (evaluator-gated doc sync, optional).** Default is
+`align_docs: false`; enabled by the Phase 1 answer. After Phase 5 Quality
 Checks, the orchestrator reads `goal.md`'s `phases:` block — when `align_docs: false`,
 skip Phase 6 with an orchestration-log entry ("Phase 6 skipped per goal.md"). When
 enabled, Quality Checks green → the align-docs skill: discover the shipped surface →
@@ -351,18 +357,6 @@ SEQUENTIAL: Store & schema → Ingest → Attribution & normalization → Rating
             Align Docs (Phase 6) ──► Pull Request (Phase 7)
 ```
 
-Layer detail, in dependency order — a task must not land before the layer it depends
-on is green:
-
-| # | Layer | Modules |
-|---|-------|---------|
-| 1 | Store & schema | `billing/otel/otel_store.py`, `billing/store.py` |
-| 2 | Ingest | `billing/otel/receiver.py`, `billing/ingest.py`, `billing/analytics_client.py` |
-| 3 | Attribution & normalization | `billing/otel/normalize.py`, `billing/otel/attribute.py` |
-| 4 | Rating & billing | `billing/otel/rating.py`, `bill.py`, `invoice.py`, `billing/reconcile.py` |
-| 5 | Export & lake sync | `billing/otel/export.py`, `fabric_client.py`, `fabric_sync.py`, `scheduler.py` |
-| 6 | Client rollout | `deploy/`, `client-package/` |
-
 Per-task and TDD verification follows the `test-ladder` skill: rung 1 (new
 tests) → rung 2 (impacted tests) mid-cycle; rung 3 (every stack's full suite) runs
 at cycle end — in the orchestrator's Phase 5 Quality Checks after the audit is APPROVED,
@@ -374,14 +368,15 @@ infrastructure and add one module plus its interface and tests.
 
 ### Evaluation intensity (`eval_depth`)
 
-Every task file's ownership-contract block carries `eval_depth: full` (default) or
-`light`. It is orchestrator-set at planning time only — a worker never sets it — and
+Every task file's ownership-contract block carries `eval_depth: light` (default) or
+`full`. It is orchestrator-set at planning time only — a worker never sets it — and
 `light` is never a skip: it shortens the evaluator's rubric to a requirements walk +
 targeted tests + write-fence check, while still ending in a real PASS / NEEDS FIXES /
-REJECT verdict. The orchestrator assigns `light` only by explicit decision, with a
-stated reason recorded in the task file or the goal's Discovery Summary;
-`goal-criteria` flags an unexplained `light` and fails a missing field closed to
-`full`.
+REJECT verdict. `full` is required (reason stated in the task file) for contract/
+scaffold tasks, tasks with interface consumers (mirroring, documenting, or testing
+the output does not count), and tasks writing agents, criteria skills, loop
+drivers/breakers, or shared infrastructure named in the goal; `goal-criteria` flags
+an unexplained `full` and fails a missing field closed to `full`.
 
 Maintainers periodically compare the verdicts recorded in each goal's
 `orchestration-log.md` against what actually happened afterward, then tune the
@@ -391,13 +386,23 @@ routing and the evaluation criteria stay calibrated over time.
 
 ---
 
-## Ground truth
+## Research Flow
 
-`README.md` is the committed ground-truth reference for this project — cite it as
-ground truth in context packages, and correct it (never the code's behavior) when the
-two disagree. The `research` skill was not installed, so there is no `_research/`
-workflow here; the align-docs and audit phases still treat `_research/` as read-only
-should the directory ever appear.
+For domain topics an external research agent must investigate without codebase access.
+
+```
+Phase 1: Generate Research Prompt → _research/prompts/[topic].md  (user copy-pastes out)
+Phase 2: Ingest Research Report   → _research/[topic]/report.md
+Phase 3: High-Level Plan          → Collaborative planning (Plan Mode)
+Phase 4: Low-Level Tasks          → _goals/[goal-name]/ structure
+```
+
+**Research locations:**
+- README.md — committed ground-truth reference. Cite as ground truth.
+- `_research/` — working/scratch area for new prompts and raw reports. Promote durable
+  findings into README.md.
+
+The output of Phase 4 (`_goals/[goal-name]/`) enters the `feature` skill at Phase 3 (goal evaluation) — it must PASS the evaluator before Phase 4 execution begins.
 
 ---
 
@@ -409,9 +414,10 @@ is implemented. It covers **all user-facing surfaces**:
 - **CLI modules** — every `python -m billing.*` entry point (`bill`, `invoice`,
   `records`, `repos`, `reconcile`, `ingest`, `report`, `fabric_sync`, `scheduler`,
   `sample_payload`). Evidence: exact invocation, full stdout/stderr, exit code.
-- **Receiver HTTP endpoints** — `POST /v1/metrics` and `POST /v1/session-repo`.
-  Evidence: status code per route, 401 when `RECEIVER_AUTH_TOKEN` is set and the token
-  is missing or wrong, 400 on a malformed body, correct gzip/chunked body handling.
+- **Receiver HTTP endpoints** — `POST /v1/metrics`, `POST /v1/session-repo`, and
+  `POST /v1/transcript-usage`. Evidence: status code per route, 401 when
+  `RECEIVER_AUTH_TOKEN` is set and the token is missing or wrong, 400 on a malformed
+  body, correct gzip/chunked body handling.
 - **Generated billing artifacts** — `invoices/*.txt`, `summary.csv`, `line_items.csv`,
   `claudeusagesummary.csv`, `claudeusagelineitems.csv`. Evidence: file present at its
   documented path, UTC date columns correct, row counts reconcile against the store,
@@ -467,6 +473,7 @@ Every subagent invocation requires a complete context package:
 ├─────────────────────────────────────────────────────────────────┤
 │  SECTION 4: CONSTRAINTS                                         │
 │  "## Write fence" (the task's writes list)                      │
+│  "## Model" (requested ID · tier · rotation)                    │
 │  "## Rules" or "## Critical Requirements"                       │
 │  - Must do X (e.g. reuse shared core modules)                   │
 │  - Must NOT do Y (e.g. re-implement auth, hit live services)    │
@@ -479,21 +486,38 @@ Every subagent invocation requires a complete context package:
 
 ### Orchestration log (spawn ledger)
 
-Maintain `_goals/[goal-name]/orchestration-log.md` as an append-only spawn ledger.
-The log header carries a running `est_tokens` total (sum of per-spawn estimates).
+`_goals/[goal-name]/orchestration-log.md` is an append-only spawn ledger written ONLY
+through the emitted tool `_kit/log-spawn.sh` (`pwsh _kit/log-spawn.ps1` on Windows —
+same flags, byte-identical output). The orchestrator runs it inline (one-line output;
+exempt from the `terminal` spawn rule). The header's running io_est_tokens /
+work_est_tokens totals are "see latest entry" — the script never rewrites a line.
+Every entry references artifact files rather than inlining them:
 
-For each subagent spawn:
+- `_goals/<goal>/spawns/NN-context.md` — the full context package as sent (NN = next
+  free two-digit number, chosen by the orchestrator). This is the verbatim record.
+- `_goals/<goal>/spawns/NN-report.md` — the subagent's report, verbatim, never polished.
+  Agents end with a `### Footprint` block (`files_read: N (~C chars)` / `commands_run: N`).
 
-- **Before launch:** timestamp, agent, model (rotation/fallback), routing reason, task
-  `writes` fence, expected outputs, and `context_chars` (character length of the
-  context package prompt).
-- **After return:** outcome line with `report_chars` (character length of the completion
-  report) and `est_tokens` = (`context_chars` + `report_chars`) / 4, labeled estimate
-  — proxy fields only; no harness in this kit exposes true token counts.
+Three subcommands (`--help` lists every flag):
 
-Ladder transitions, guard trips, and phase skips (e.g. Phase 6/7 declined via
-`goal.md`'s `phases:` block) are logged as separate entries. Append-only — rejections
-and respawns are new entries, never in-place edits.
+- **Before launch** — `spawn --goal G --agent A --phase "P" --model-requested M --context _goals/G/spawns/NN-context.md [--writes …] [--why …] [--expect …]`
+  appends `### <ts> — SPAWN A (P) [#NN]` plus bullet lines for agent · model requested,
+  why, writes claim, expected output, and `context: <path> · context_chars: <N>` (N =
+  measured file bytes).
+- **After return** — `outcome --goal G --spawn NN --report _goals/G/spawns/NN-report.md --verdict "V" --model-reported "M" [--note …] [--work-chars C]`
+  appends `- OUTCOME [#NN]: V · model reported: M · report: <path> · report_chars: <R> · io_est_tokens: <T> · work_read_chars: <C|n/a> · work_est_tokens: <W|n/a> · running io: <X> · running work: <Y>`
+  where `io_est_tokens` T = (`context_chars` + `report_chars`) / 4 — orchestrator I/O
+  proxy (chars/4), not the subagent's spend — and `work_est_tokens` W comes from the
+  Footprint `files_read` line (W = C/4; `n/a` if missing/malformed — flag to the
+  evaluator; `--work-chars C` overrides). `running io` / `running work` are the previous
+  totals plus T / W (`running io` falls back to pre-v0.26 `running total`; W=`n/a` adds 0).
+- **Everything else** — `note --goal G --text "…"` appends `### <ts> — …` for phase
+  completions, ladder transitions (with the rung name), guard trips, and skips (e.g.
+  Phase 6/7 declined via `goal.md`'s `phases:` block).
+
+Exit codes: 0 ok · 2 usage error · 3 ledger integrity (duplicate SPAWN/OUTCOME `[#NN]`,
+outcome without its SPAWN) · 4 missing goal directory or artifact file. Rejections and
+respawns are new entries with new NNs, never in-place edits.
 
 ---
 
@@ -501,8 +525,10 @@ and respawns are new entries, never in-place edits.
 
 ### Continuation ladder (Phase 4 task execution)
 
-When Task Execution (Phase 4) exhausts its 3 implement→evaluate fix cycles, the
-orchestrator runs this ladder before terminal human escalation. Apply in this order:
+When Task Execution (Phase 4) exhausts its 3 implement→evaluate fix cycles, read
+`goal.md`'s `phases.ladder`. `escalate` (default, or key absent): escalate to the user
+with the continuation ladder offered as option 1. `auto`: run this ladder before
+terminal human escalation. Apply in this order:
 
 1. **Bypass check (every verdict, every cycle).** A verdict tagged with a bypass failure
    class (`destructive`, `security`, `infra`) stops all retrying immediately — including
@@ -541,8 +567,8 @@ orchestrator runs this ladder before terminal human escalation. Apply in this or
 - A **repeated failure signature** stops the ladder immediately.
 - Every rung transition is an orchestration-log entry recording agent, model, rung, and
   trigger.
-- token/cost budgets are NOT a guard in this kit — no harness exposes token counts
-  to markdown policy.
+- Token/cost budgets are not a guard in interactive mode (no harness exposes true usage to the
+  orchestrator); the headless loop records real usage per iteration via `LOOP_USAGE_FORMAT` — gating on it is a future knob, not this ladder's.
 
 **Attempt accounting:** The diagnosis-driven implementation attempt costs 1 of the 3.
 Each rung-6 subtask implement→evaluate cycle costs 1 of the 3. Before splitting, the
@@ -565,7 +591,7 @@ backstop.
 | Phase | Max Cycles | On Exhaust |
 |-------|------------|------------|
 | Goal Evaluation (Phase 3) | 3 revise→re-evaluate | Escalate to user |
-| Task Execution (Phase 4) | 3 implement→evaluate per task | Continuation ladder (rungs 5→4→6), then escalate to user |
+| Task Execution (Phase 4) | 3 implement→evaluate per task | phases.ladder=auto: continuation ladder (rungs 5→4→6) then escalate; escalate (default): escalate to user, ladder offered |
 | Final Audit (Phase 5) | 3 fix→re-audit | Escalate to user |
 | Align Docs (Phase 6) | 3 per doc + 3 for plan and final doc audit | Escalate to user |
 | Pull Request (Phase 7) | n/a — gated on explicit user approval | User edits or declines the draft |
@@ -574,7 +600,7 @@ backstop.
 ### Mandatory Re-Evaluate Invariants
 
 - **Phase 3**: Goal evaluation loop ONLY exits to Phase 4 via a PASS verdict. Revisions without re-evaluate are forbidden.
-- **Phase 4**: A task is ONLY marked complete after the evaluator returns PASS. Fixes without re-evaluate are forbidden.
+- **Phase 4**: A task is ONLY marked complete after the evaluator returns PASS or PASS (with notes) (`PASS (with notes)` counts as PASS). Fixes without re-evaluate are forbidden.
   Fix cycles rotate models — cycle 2 uses a different model family, cycle 3 the frontier tier (see the model map) — and every spawn is recorded in the goal's append-only orchestration log.
 - **Phase 5**: Audit loop ONLY exits to Quality Checks via an APPROVED verdict. Remediations without re-audit are forbidden.
 - **Phase 6**: A doc is ONLY complete after the evaluator returns PASS; the doc set ONLY ships after the final doc audit returns APPROVED. `_research/`, `_goals/`, and code are never touched.
@@ -602,7 +628,7 @@ criterion **verbatim** in the **Issue** line.
 
 ---
 
-## Autonomous Loop
+## Autonomous Loop (Optional)
 
 The `auto-loop` skill runs the orchestration flow unattended, **one feature per
 iteration**, pulling work from a backlog instead of Phase 1 user alignment. Each
@@ -614,7 +640,11 @@ in-flight claims, increments `attempts` at claim time, and integrates via the
 single-writer integrator; dispatched slots never re-select stories, never increment
 `attempts`, and never print the completion sentinel — that sentinel belongs to
 **manual** runs only. Concurrency: `LOOP_SLOTS` > 1 is honored iff `LOOP_WORKTREE=1`
-(default 2, clamped [1,3]).
+(default 2, clamped [1,3]). Usage capture: `LOOP_USAGE_FORMAT` (`auto`|`claude`|`codex`|
+`cursor`|`none`; `auto` = basename of `LOOP_CLI`'s first word) and optional `LOOP_USAGE_LOG`. When a
+format is active the driver prints `usage: input=<n> output=<n> cache_read=<n|n/a>
+cache_write=<n|n/a> cost_usd=<x|n/a> format=<f>` after each slot's `tail -n 25` block
+(silent when unset and `auto` resolves to none).
 
 **Manual-mode view** (human-invoked or non-dispatched `auto-loop`):
 
@@ -690,25 +720,31 @@ drifting run early. Headless entry point: `_loop/loop.sh [max-iterations]` (bash
 │   │   ├── reference/continuation-ladder.md
 │   │   └── templates/{goal.md,task.md}
 │   │
+│   ├── research/ # Research → Plan
+│   │   ├── SKILL.md
+│   │   └── templates/{research-prompt.md,research-report.md}
+│   │
 │   ├── goal-criteria/SKILL.md         # Goal evaluation criteria
 │   ├── task-criteria/SKILL.md         # Task evaluation criteria
 │   ├── qa-criteria/SKILL.md           # User-facing QA evaluation criteria
 │   ├── test-ladder/SKILL.md    # Rungs 1–2 mid-cycle, rung 3 at cycle end
 │   ├── align-docs/SKILL.md            # Phase 6: evaluator-gated doc sync
 │   ├── ship-pr/SKILL.md       # Phase 7: approval-gated PR creation
-│   ├── auto-loop/SKILL.md             # One autonomous iteration
-│   └── setup-models.map.md            # Resolved model IDs (single source of truth)
+│   └── auto-loop/SKILL.md             # One autonomous iteration (if loop enabled)
 │
 └── ORCHESTRATION.md   # This file
 
-_goals/backlog.md               # Story backlog for the autonomous loop (seed — yours to edit)
-_goals/<goal>/orchestration-log.md  # Append-only spawn ledger per goal
+_goals/backlog.md               # Story backlog for the autonomous loop (if enabled)
+_goals/<goal>/orchestration-log.md  # Append-only spawn ledger per goal (written by _kit/log-spawn.*)
+_goals/<goal>/spawns/NN-context.md  # Context package sent to spawn #NN (verbatim)
+_goals/<goal>/spawns/NN-report.md   # Report returned by spawn #NN (verbatim)
 _goals/breaker-state.json       # Model circuit breaker state (runtime, gitignored)
-_loop/{loop.sh,loop.ps1,breaker.sh,breaker.ps1,PROMPT.md}  # Headless loop driver
+_kit/{log-spawn.sh,log-spawn.ps1}  # Single-copy tools: orchestration-log writer twins
+_loop/{loop.sh,loop.ps1,breaker.sh,breaker.ps1,PROMPT.md}  # Headless loop driver (if enabled)
 ```
-
-No project domain or supporting skills exist yet; when one is added, list it here and
-in the Component Overview table.
+│   ├── python-testing-patterns/SKILL.md        # pytest fixtures/mocking/TDD (third-party)
+│   ├── python-performance-optimization/SKILL.md  # profiling + perf (third-party)
+│   ├── python-appservice-deploy/SKILL.md       # App Service deploys (third-party, reference only)
 
 ### Critical Reference Files
 
@@ -724,13 +760,13 @@ in the Component Overview table.
 
 ### Quality Checks
 
-| Step | Command |
-|------|---------|
-| Tests (rung 3 — full suites, cycle end only) | `python -m pytest -q` |
-
 **No linter and no type checker are configured in this repo.** Do not invent `ruff`,
 `flake8`, `black`, or `mypy` steps at cycle end. If one is adopted, add its row here
 and to the `test-ladder` skill's rung 3 section in the same change.
+
+| Step | Command |
+|------|---------|
+| Tests (rung 3 — full suites, cycle end only) | python -m pytest -q |
 
 Don't invent commands for tools that aren't configured. Tests must mock all external
 service/network access. Do not run rung 3 during Phase 4 tasks or TDD loops — except
@@ -743,8 +779,10 @@ session.
 
 **Setup:**
 ```bash
-python -m pip install pytest   # the ONLY dependency, and it is test-only —
-                               # the engine itself is standard-library-only
+uv pip install pytest          # the ONLY dependency, and it is test-only —
+                               # the engine itself is standard-library-only.
+                               # Zero-install alternative, nothing persisted:
+                               #   uv run --with pytest python -m pytest
 cp .env.example .env           # optional: needed only for receiver auth,
                                # the Analytics API, or lake sync
 ```
@@ -755,11 +793,21 @@ python -m pytest tests/test_<name>.py -v     # rungs 1–2, during Phase 4 / TDD
 python -m pytest -q         # rung 3 — cycle end only
 ```
 
+**Orchestration log** (orchestrator runs these inline; `pwsh _kit/log-spawn.ps1` on Windows):
+```bash
+_kit/log-spawn.sh spawn --goal my-goal --agent implementer --phase "Phase 4 task 02" \
+  --model-requested <model-id> --context _goals/my-goal/spawns/03-context.md \
+  --writes "src/foo.ts" --why "task 02" --expect "completion report"
+_kit/log-spawn.sh outcome --goal my-goal --spawn 03 --report _goals/my-goal/spawns/03-report.md \
+  --verdict "PASS" --model-reported "<model-id as self-reported>"
+_kit/log-spawn.sh note --goal my-goal --text "Phase 4 complete"
+```
+
 ### Invoking Skills
 
 ```
 /feature            - Start a new feature implementation (Phases 1–7)
-/auto-loop          - Run ONE unattended iteration from _goals/backlog.md
+/research           - Research → Plan workflow for a domain topic
 /align-docs         - Phase 6 standalone: sync docs to shipped code
 /ship-pr    - Phase 7 standalone: draft + create the PR/MR on the project's forge, or hand over
 /test-ladder - Test-rung rules (also routed into every impl/test task)
@@ -772,13 +820,10 @@ evaluator subagents — they are not invoked directly.
 
 | Subagent | Default Stance | Key Behavior | Auto-Fail Triggers |
 |----------|----------------|--------------|-------------------|
-| `evaluator` | Score starts at 2/5 | Actively looks for code problems | Third-party import added to `billing/`; secret hardcoded or logged; SQLite single-writer constraint broken; attribution persisted instead of resolved at query time; repo key bypassing `normalize.py`; auth check weakened or 401/403 swallowed; persisted invoice record mutated; test hitting a live service; hook that can exit non-zero |
-| `qa-evaluator` | Score starts at 2/5 | User-perspective behavioral QA | Raw traceback shown to the user; wrong exit code; receiver 5xx, or 200 on an unauthenticated/malformed POST; invoice or CSV with missing/incorrect UTC date columns; success reported with no effect (outbox still `pending`, nothing uploaded); usage double-counted; `UnicodeEncodeError` on a Windows cp1252 console; secret in any output |
+| `evaluator` | Score starts at 2/5 | Actively looks for code problems | Third-party import in `billing/`; secret hardcoded or logged; single-host SQLite constraint broken; repo attribution persisted instead of resolved at query time; repo key bypassing `normalize.py`; auth enforcement weakened; persisted invoice mutated; test hitting a live external service; a telemetry hook path (`claude-repo-tag.py` or `claude-transcript-usage.py`) that can exit non-zero |
+| `qa-evaluator` | Score starts at 2/5 | User-perspective behavioral QA | Raw traceback from a `python -m billing.*` CLI; wrong exit code; receiver 5xx or a 200 on an unauthenticated/malformed POST; missing or wrong UTC date columns in an invoice or CSV; success reported without the effect happening; usage double-counted; `UnicodeEncodeError` on a cp1252 console; a secret in any output |
 | `implementer` | Must complete ALL | Checklist-driven execution | Skipping requirements |
 | `test-writer` | 100% coverage required | Outcome-verifying tests | Functions without tests, live external-service calls |
-
-The full, reasoned lists live in `.claude/agents/evaluator.md` and
-`.claude/agents/qa-evaluator.md` — the cells above are the summary.
 
 ### Workflow State Tracking
 
@@ -836,7 +881,7 @@ See ### Forge adapter (Phase 7 delivery).
 2. **Subagents execute with fresh context** - No fatigue, no bias
 3. **Evaluation is always separate** - Pessimistic evaluators review all work (code AND behavior)
 4. **Re-evaluate is mandatory** - Fixes/revisions MUST be re-verified by an evaluator subagent
-5. **Retries have limits (3 cycles)** - Phase 4 task execution continues through the continuation ladder (rungs 5→4→6) before escalation; other phases escalate after 3 cycles
+5. **Retries have limits (3 cycles)** - Phase 4 task execution then reads `phases.ladder`: `auto` continues through the continuation ladder (rungs 5→4→6) before escalation; `escalate` (default) escalates with the ladder offered; other phases escalate after 3 cycles
 6. **Escalation is explicit** - User gets clear options and required decisions
 7. **The Iron Law is enforced** - Tests define behavior, implementation must conform
 8. **Shared core is reused** - New modules build on shared infrastructure; never re-implement auth/transport/plumbing

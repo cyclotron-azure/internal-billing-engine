@@ -141,8 +141,10 @@ Decisions (Phase 2 gates):
 ## Constraints
 
 - **Standard library only.** No third-party import may enter `billing/`, `deploy/`, or `client-package/`.
-  `pytest` is the sole dev dependency and lives only under `tests/`. It is not installed by default —
-  `python -m pip install pytest` is a one-time step.
+  `pytest` is the sole dev dependency and lives only under `tests/`. Package management is **`uv`**,
+  not `pip`: `uv pip install pytest` is the one-time step, or `uv run --with pytest python -m pytest`
+  to run with nothing persisted. This is a tooling choice only — it does not relax the stdlib-only
+  runtime constraint, and `uv` is never imported by any module.
 - **The hook must never break a developer's session.** Always exit 0, short timeouts, failures swallowed.
 - **Never read `~/.claude/.credentials.json`.** Identity comes from `~/.claude.json` only.
 - **SQLite stays single-host, single-connection.** No threading the receiver, no pool.

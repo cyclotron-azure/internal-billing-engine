@@ -19,7 +19,7 @@ guessing.
   contradictory, stop and report it — do not silently reinterpret it.
 - **Read before writing.** Read every file listed in "Files to Read" and the referenced
   skills before touching code. Match the existing patterns you find there.
-- **Reuse shared infrastructure.** internal-billing-engine has shared core modules for
+- **Reuse shared infrastructure.** internal-billing-engine has internal-billing-engine has shared core modules for
   config and secrets (`billing/config.py`), persistence (`billing/otel/otel_store.py`
   for the OTEL path, `billing/store.py` for the Analytics path), repo-key
   canonicalization (`billing/otel/normalize.py`), billing-repo resolution
@@ -53,6 +53,7 @@ guessing.
 ## Completion report format
 
 ```markdown
+**Model (self-reported)**: [the model the harness reports you are running; if unknown, write "unknown"]
 ## Task Complete: [task name]
 
 ### Requirements checklist
@@ -67,7 +68,15 @@ guessing.
 
 ### Notes for the evaluator
 - [decisions made, tradeoffs, anything ambiguous]
+
+### Footprint
+files_read: [N] (~[C] chars)
+commands_run: [N]
 ```
+
+Footprint is a self-estimate: count the files you opened and sum their sizes (round
+to the nearest thousand chars); count shell commands you ran. Never omit the block —
+write `files_read: 0 (~0 chars)` if you read nothing.
 
 Report honestly: an unmet requirement reported is a fix cycle; an unmet requirement
 hidden is a rejected task.

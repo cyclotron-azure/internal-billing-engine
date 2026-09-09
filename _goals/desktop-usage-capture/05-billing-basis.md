@@ -89,7 +89,14 @@ eval_depth: full
 
 ## Acceptance Criteria
 
-1. A store with OTLP cost rows only produces `bill.py` output matching `tests/golden/bill_otlp_baseline.txt`
+1. **The golden comparison MUST normalize line endings** — read the baseline as bytes and compare with
+   `\r\n` normalized to `\n` on both sides (or open with `newline=""` and normalize explicitly). Never a
+   naive text-mode `==`. Verified reason: `core.autocrlf=true` here and the baseline currently carries
+   no `.gitattributes` rule, so a committed 2000-byte LF file checks out as 2045 bytes with CRLF and a
+   naive diff fails for a reason that has nothing to do with billing. Task 06 additionally pins
+   `tests/golden/** -text`; this normalization is the independent half of that defense and is required
+   even once the pin lands.
+1b. A store with OTLP cost rows only produces `bill.py` output matching `tests/golden/bill_otlp_baseline.txt`
    captured by task 00 before any change — verification: unit test diffing against the golden file. This
    is the regression gate for the existing fleet.
 2. A store with transcript rows only bills a non-zero total and labels the basis as rate-card —

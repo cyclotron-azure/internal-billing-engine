@@ -30,3 +30,4 @@ otel-data/
 _goals/breaker-state.json
 _goals/breaker-state.json.tmp.*
 .loop-worktrees/
+_kit/

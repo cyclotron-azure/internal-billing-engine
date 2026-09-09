@@ -21,7 +21,8 @@
       { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-repo-tag.py" }] }
     ],
     "SessionEnd": [
-      { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-repo-tag.py" }] }
+      { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-repo-tag.py" }] },
+      { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-transcript-usage.py" }] }
     ],
     "UserPromptSubmit": [
       { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-repo-tag.py", "async": true }] }

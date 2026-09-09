@@ -5,7 +5,10 @@ Backend engine to obtain Claude Code usage data and its link with its associated
 Can run locally because of .claude > settings.local.json, settings (deploy/) will have to be pushed to all dev machines in order for global telemetry to be captured.
 
 No third-party Python dependencies — standard library only, Python 3.10+. Nothing
-to `pip install`.
+to `pip install`. That's true of the **runtime** (`billing/`, `deploy/`,
+`client-package/`); the `tests/` suite is the one exception and needs `pytest`,
+the sole dev dependency. Install it however you prefer, then run the suite with
+`python -m pytest` from the repo root.
 
 ---
 
@@ -89,7 +92,7 @@ the **next** session, and exports every 60s — so give it a minute before check
 ## 1: Receiving telemetry data
 The engine gets data via an OTLP/JSON receiver (receiver.py) that ingests telemetry emitted by Claude Code on each dev machine. Deduped datapoints are stored in a single-host SQLite database.
 
-The same receiver also accepts `POST /v1/session-repo` — not an OTLP endpoint, but the session→repo timeline written by the `claude-repo-tag.py` hook. Claude Code freezes `OTEL_RESOURCE_ATTRIBUTES` at launch, so the wrapper's `repo=` tag can't follow a developer who `cd`s into another client's repo mid-session; the timeline can, and `attribute.py` joins it back onto each datapoint at billing time. Writes are authenticated with a shared fleet token (`RECEIVER_AUTH_TOKEN`).
+The same receiver also accepts `POST /v1/session-repo` — not an OTLP endpoint, but the session→repo timeline written by the `claude-repo-tag.py` hook. Claude Code freezes `OTEL_RESOURCE_ATTRIBUTES` at launch, so the wrapper's `repo=` tag can't follow a developer who `cd`s into another client's repo mid-session; the timeline can, and `attribute.py` joins it back onto each datapoint at billing time. It also accepts `POST /v1/transcript-usage` — a batched, authenticated endpoint that ingests desktop-app usage recovered from on-disk Claude Code transcripts by the `claude-transcript-usage.py` hook (see `billing/otel/transcript.py`). Writes are authenticated with a shared fleet token (`RECEIVER_AUTH_TOKEN`).
 
 ## 2: Push data to ADLS
 A scheduler (scheduler.py) regenerates two flat all-history CSVs (claudeuseagesummary, claudeusagelineitems) and enqueues them. Sync worker (fabric_sync.py) drains outbox and uploads to ADLS (rg-cyclotron-insights > sacyclotroninsights > cyclotroninsights), overwriting each file. Scheduled daily but can be modified (SYNC_FREQUENCY in .env).
@@ -142,10 +145,11 @@ Shared:
 
 ### `billing/otel/` — the OTEL (repo-level) path
 
-- **`receiver.py`** — minimal OTLP/JSON HTTP server. Accepts `claude_code.token.usage` and `claude_code.cost.usage` from Claude Code (handles chunked + gzip bodies), extracts repo/user/model/token-type, dedupes, writes to the store. Also accepts `POST /v1/session-repo` from the repo-tag hook. Every POST must present the shared fleet token (`X-Billing-Token` or `Authorization: Bearer`) once `RECEIVER_AUTH_TOKEN` is set; unset means open, with a loud startup warning.
+- **`receiver.py`** — minimal OTLP/JSON HTTP server. Accepts `claude_code.token.usage` and `claude_code.cost.usage` from Claude Code (handles chunked + gzip bodies), extracts repo/user/model/token-type, dedupes, writes to the store. Also accepts `POST /v1/session-repo` from the repo-tag hook, and `POST /v1/transcript-usage` — a batched endpoint for desktop-app usage recovered from on-disk transcripts (see `transcript.py` below), with per-record rejection so one malformed record never costs the rest of a batch its billing. Every POST must present the shared fleet token (`X-Billing-Token` or `Authorization: Bearer`) once `RECEIVER_AUTH_TOKEN` is set; unset means open, with a loud startup warning.
   `python -m billing.otel.receiver` (`--host`, `--port`, `--db`, `--require-auth`)
-- **`attribute.py`** — resolves *which repo a datapoint bills to*, at query time. Joins the `session_repo_timeline` onto each datapoint as-of its own timestamp, so a session that moved between repos splits across them. Falls back through `timeline → wrapper → no_remote → absent`, and exposes that choice as `attribution_source` so you can see which signal is carrying the bill. Resolution is derived, never stored: a late or corrected timeline retroactively fixes past bills with no re-ingest.
-- **`otel_store.py`** — SQLite store: deduped `token_usage` and `cost_usage` datapoints, the `session_repo_timeline`, persisted invoices + line items, the optional `repo_name_map` override table, and the `fabric_outbox` delivery queue.
+- **`transcript.py`** — the wire-payload contract for `POST /v1/transcript-usage`: a 14-field schema (fail-closed — an unknown field, including `cwd`, is a per-record rejection, never silently ignored), per-record validation, `MAX_BATCH_SIZE=500`, and the mapping from one validated record to its `token_usage` rows (terminal-block collapse already done client-side) plus a rate-card-costed `cost_usage` row. Pure and stdlib-only — no I/O, no store access.
+- **`attribute.py`** — resolves *which repo a datapoint bills to*, at query time. Joins the `session_repo_timeline` onto each datapoint as-of its own timestamp, so a session that moved between repos splits across them. Falls back through `desktop-scratch → timeline → absent → no_remote → wrapper` (checked in that order — `desktop-scratch` is deliberately first: a scratch desktop session still gets a timeline row, but one that carries no billable repo, so it must be claimed before the `timeline` branch would otherwise claim it), and exposes that choice as `attribution_source` so you can see which signal is carrying the bill. Resolution is derived, never stored: a late or corrected timeline retroactively fixes past bills with no re-ingest.
+- **`otel_store.py`** — SQLite store: deduped `token_usage` and `cost_usage` datapoints (each carrying `usage_source` — `otlp` | `transcript` — plus `token_usage.entrypoint` and `cost_usage.cost_source` — `actual` | `rate_card` — so desktop-sourced rows are distinguishable from CLI/OTLP ones), the `session_repo_timeline`, persisted invoices + line items, the optional `repo_name_map` override table, and the `fabric_outbox` delivery queue.
 - **`normalize.py`** — collapses git remote forms (ssh vs https, `.git`, case) into one canonical repo key so a repo isn't billed twice, and derives the short repo name (`repo_name`) that is the billing identity.
 - **`repos.py`** — manage the OPTIONAL repo→billing-name override map: `export` observed repos to CSV, edit the `bill_name` column to rename/group a repo, then `import`. Not needed by default — every repo bills under its own name.
   `python -m billing.otel.repos export --out repo_name_map.csv`
@@ -175,6 +179,16 @@ Shared:
   and (async) `UserPromptSubmit`, POSTing one timeline entry per repo change to
   `/v1/session-repo`. Unlike the wrapper it runs on **every** Claude Code surface,
   not just the CLI. Designed never to break a session: always exits 0.
+- **`claude-transcript-usage.py`** — a second, standalone hook that ships
+  desktop-app usage the OTLP exporter can't see: it reads Claude Code's on-disk
+  transcripts (recursively, so it also reaches subagent/sidechain files and
+  crashed sessions in other project directories), collapses each API request's
+  cumulative streaming blocks to its terminal block, and POSTs batches of
+  `billing/otel/transcript.py`'s wire payload to `/v1/transcript-usage`.
+  Registered on **`SessionEnd` only** — unlike `claude-repo-tag.py`'s five
+  events — because it does real work (a recursive transcript sweep) rather than
+  one small POST per firing. Same never-break-a-session design: always exits 0,
+  short timeouts, failures swallowed.
 - **`dev-selftest.sh`** — scoped launcher to generate real telemetry from one
   machine into a local receiver (for testing before a fleet rollout).
 - **`start-local.ps1`** — runs the receiver directly on a Windows host, no Docker.
@@ -482,9 +496,11 @@ Postgres.
 Push via MDM in waves (10% → 50% → 100%), watching receiver load and the
 `unknown` rate at each step:
 
-**Three artifacts, not two** — `managed-settings.json`, `claude-wrapper.sh`, and
-`claude-repo-tag.py`. The hook is what keeps a mid-session repo switch from
-billing to the wrong client, and it is the only one that covers non-CLI surfaces.
+**Four artifacts, not two** — `managed-settings.json`, `claude-wrapper.sh`,
+`claude-repo-tag.py`, and `claude-transcript-usage.py`. The repo-tag hook is what
+keeps a mid-session repo switch from billing to the wrong client, and it is the
+only one that covers non-CLI surfaces; the transcript hook is what recovers
+desktop-app usage that has no OTLP exporter at all.
 
 1. `managed-settings.json` to the system path for each OS, with the real fleet
    token substituted for the placeholders.
@@ -500,14 +516,20 @@ billing to the wrong client, and it is the only one that covers non-CLI surfaces
 3. `claude-repo-tag.py` to `/opt/cyclotron/claude-repo-tag.py`, executable, with
    the path matching what `managed-settings.json` registers. Needs `python3` on
    the PATH.
-4. **All three together.** Settings without the wrapper is the worst outcome: it
-   looks like success while being entirely unbillable. Wrapper without the hook
-   bills mid-session repo switches to the wrong client — which is worse than not
-   billing, because it's wrong rather than missing.
-5. Verify per wave using `deploy/README.md`, and confirm the managed-settings path
+4. `claude-transcript-usage.py` to `/opt/cyclotron/claude-transcript-usage.py`,
+   executable, path matching its `SessionEnd`-only registration in
+   `managed-settings.json`. Also needs `python3` on the PATH; stdlib-only, same
+   as the other hook.
+5. **All four together.** Settings without the wrapper is the worst outcome: it
+   looks like success while being entirely unbillable. Wrapper without the
+   repo-tag hook bills mid-session repo switches to the wrong client — which is
+   worse than not billing, because it's wrong rather than missing. Without the
+   transcript hook, desktop-app usage simply never bills anyone, with nothing
+   reporting it as missing.
+6. Verify per wave using `deploy/README.md`, and confirm the managed-settings path
    against the installed Claude Code version rather than trusting the table.
    `bill.py`'s ATTRIBUTION SOURCE breakdown is the fastest read on whether the
-   hook actually landed: all-`wrapper` means it didn't.
+   repo-tag hook actually landed: all-`wrapper` means it didn't.
 
 ### Phase 5 — Schedule the sync
 

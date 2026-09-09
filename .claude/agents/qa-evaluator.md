@@ -31,22 +31,23 @@ through implementer and evaluator, then QA re-runs.
 
 Apply the criteria in `.claude/skills/qa-criteria/SKILL.md`.
 
+This project has three user-facing surfaces. There is **no web UI** — a QA report
+claiming to have checked one is itself a defect.
+
 - **CLI modules** — every `python -m billing.*` entry point (`bill`, `invoice`,
   `records`, `repos`, `reconcile`, `ingest`, `report`, `fabric_sync`, `scheduler`,
-  `sample_payload`). Evidence: the exact invocation, the full stdout/stderr, and the
-  exit code. A CLI change with no captured invocation is unevaluatable — say so rather
-  than passing it.
-- **Receiver HTTP endpoints** — `POST /v1/metrics` and `POST /v1/session-repo`.
-  Evidence: the status code per route; a 401 when `RECEIVER_AUTH_TOKEN` is set and the
-  token is missing or wrong; a 400 on a malformed body; and correct handling of gzip
-  and chunked request bodies. An unauthenticated write that succeeds is a billing-
-  integrity failure, not a minor one.
+  `sample_payload`). Evidence: the exact invocation, full stdout/stderr, and the exit
+  code. Date-windowed commands must distinguish "no rows in this window" from "the run
+  failed".
+- **Receiver HTTP endpoints** — `POST /v1/metrics`, `POST /v1/session-repo`, and
+  `POST /v1/transcript-usage`. Evidence: the status code per route, a 401 when
+  `RECEIVER_AUTH_TOKEN` is set and the token is missing or wrong, a 400 on a malformed
+  body, and correct gzip/chunked body handling. Replaying an identical payload must not
+  create duplicate datapoints.
 - **Generated billing artifacts** — `invoices/*.txt`, `summary.csv`, `line_items.csv`,
-  and the two lake CSVs (`claudeusagesummary.csv`, `claudeusagelineitems.csv`).
-  Evidence: the file exists at its documented path; the UTC date columns
-  (`usage_date_utc`, `first_usage_at_utc`, `last_usage_at_utc`, `period_start`,
-  `period_end`, `generated_at`) are present and correct; row counts reconcile against
-  the store; and a re-run overwrites rather than double-counting.
+  `claudeusagesummary.csv`, `claudeusagelineitems.csv`. Evidence: the file present at
+  its documented path, correct UTC date columns, row counts reconciling against the
+  store, and a re-run overwriting rather than double-counting.
 
 ## Auto-fail triggers
 
@@ -72,6 +73,7 @@ Apply the criteria in `.claude/skills/qa-criteria/SKILL.md`.
 ## Verdict format
 
 ```markdown
+**Model (self-reported)**: [the model the harness reports you are running; if unknown, write "unknown"]
 ## QA Verdict: [PASS | ISSUES FOUND | REJECT]
 **Score**: N/5
 
@@ -83,7 +85,15 @@ Apply the criteria in `.claude/skills/qa-criteria/SKILL.md`.
 
 ### Missing evidence
 - [surface/behavior claimed but not demonstrated]
+
+### Footprint
+files_read: [N] (~[C] chars)
+commands_run: [N]
 ```
+
+Footprint is a self-estimate: count the files you opened and sum their sizes (round
+to the nearest thousand chars); count shell commands you ran. Never omit the block —
+write `files_read: 0 (~0 chars)` if you read nothing.
 
 Every issue must include exact reproduction steps so a fix task can be written from it
 directly.

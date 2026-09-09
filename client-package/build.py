@@ -55,6 +55,7 @@ CONTENTS = (
     "install.ps1",
     "configure.py",
     "claude-repo-tag.py",
+    "claude-transcript-usage.py",
     "VERSION",
 )
 

@@ -239,6 +239,14 @@ eval_depth: full
       `*.py text eol=lf`, so the existing precedent pair already differs in the working tree
       (`deploy/claude-repo-tag.py` 4521 B CRLF vs `client-package/claude-repo-tag.py` 4414 B LF). A
       byte-comparison test would pass on the machine that wrote the files and fail on the next clone.
+- [ ] **Add `tests/golden/** -text` to the repo root `.gitattributes`**, so the golden baseline is
+      treated as binary and never newline-translated. Verified exposure: `core.autocrlf=true` on this
+      machine and `git check-attr text -- tests/golden/bill_otlp_baseline.txt` returns `unspecified`,
+      so the committed 2000-byte LF file checks out as 2045 bytes with CRLF. Task 05's AC1 diffs
+      against that file as its regression gate for the existing OTLP fleet; a newline-translated
+      baseline fails that diff on every Windows checkout for a reason unrelated to billing — a false
+      red on the one gate that protects current invoices. This rule is defense in depth alongside task
+      05's normalized comparison; both are required, because either alone leaves a sharp edge.
 - [ ] Add `deploy/*.py text eol=lf` to the repo root `.gitattributes`, so the `deploy/` hook is checked
       out with LF on every platform. Without it, a macOS or Linux fleet machine receives a CRLF shebang
       line and the hook fails to execute — silently, because the hook is required to exit 0.

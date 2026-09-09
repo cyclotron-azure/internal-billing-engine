@@ -19,15 +19,19 @@ test is a failed task.
 - **Assert outcomes.** A test must fail if the behavior regresses. Asserting "no
   exception was raised" or mocking the unit under test itself are auto-fails.
 - **Mock all external services.** No test may hit the network or a live service.
+No test may hit the network or a live service.
   Mock at this project's own client boundaries, not at the `urllib` level: patch
   `billing.analytics_client.AnalyticsClient` for the Anthropic Analytics API, and
   `billing.otel.fabric_client` for ADLS Gen2 / OneLake uploads. For the receiver, drive
-  `POST /v1/metrics` and `POST /v1/session-repo` against an in-process handler rather
-  than binding a real port. For SQLite, use a `tmp_path` database file (or `:memory:`)
+  `POST /v1/metrics`, `POST /v1/session-repo`, and `POST /v1/transcript-usage` against
+  an in-process handler rather than binding a real port. For SQLite, use a `tmp_path`
+  database file (or `:memory:`)
   — never `data/otel.db`, and never a shared path that two tests could race on.
   Tooling is stdlib plus `pytest`: use `unittest.mock.patch`, `monkeypatch`, and
   `tmp_path`. Do not add a mocking library (`responses`, `respx`, `requests-mock`) —
-  the dependency budget for tests is `pytest` and nothing else.
+  the dependency budget for tests is `pytest` and nothing else. `tests/conftest.py`
+  holds the shared fixtures, including a frozen pre-migration copy of the store schema
+  (`LEGACY_SCHEMA`) that migration tests must use verbatim rather than importing.
 - **Follow the project's test conventions.** Read existing tests first and match their
   structure, naming, and fixture usage. Test framework(s): pytest.
 - **Run what you write.** Climb rungs 1–2 of the `test-ladder` skill only
@@ -52,6 +56,7 @@ test is a failed task.
 ## Completion report format
 
 ```markdown
+**Model (self-reported)**: [the model the harness reports you are running; if unknown, write "unknown"]
 ## Test Task Complete
 
 ### Coverage map
@@ -64,4 +69,12 @@ test is a failed task.
 
 ### Gaps
 - [anything in scope you could not test, and why]
+
+### Footprint
+files_read: [N] (~[C] chars)
+commands_run: [N]
 ```
+
+Footprint is a self-estimate: count the files you opened and sum their sizes (round
+to the nearest thousand chars); count shell commands you ran. Never omit the block —
+write `files_read: 0 (~0 chars)` if you read nothing.

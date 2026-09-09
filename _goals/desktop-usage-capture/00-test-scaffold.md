@@ -16,6 +16,7 @@ that is impossible to make after `bill.py` has already been rewritten.
 # --- task ownership contract ---
 writes:
   - tests/conftest.py
+  - tests/test_conftest.py
   - tests/golden/bill_otlp_baseline.txt
   - tests/golden/README.md
 reads:
@@ -105,9 +106,12 @@ eval_depth: full
       behavior, and the exact circumstances under which it may legitimately be regenerated.
 - [ ] No production file is modified. This task's write fence is tests only.
 - [ ] No dependency beyond `pytest`.
-- [ ] Note for the implementer: `pytest` is not installed in this environment. Per
-      `.claude/ORCHESTRATION.md`, run `python -m pip install pytest` once before the first test run.
-      If installation is unavailable, report that plainly rather than faking a passing run.
+- [ ] Note for the implementer: this project uses **`uv`**, not `pip`. `pytest 9.1.1` is already
+      installed in the active interpreter, so no install step is needed for this task. If a future
+      environment lacks it, per `.claude/ORCHESTRATION.md` the command is `uv pip install pytest`
+      (or `uv run --with pytest python -m pytest` to run with nothing persisted). Do not invoke `pip`.
+      If pytest is unavailable and cannot be installed, report that plainly rather than faking a
+      passing run.
 
 ## Acceptance Criteria
 

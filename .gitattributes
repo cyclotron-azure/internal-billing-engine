@@ -11,3 +11,15 @@ _goals/ESCALATIONS.md merge=union
 _goals/*/orchestration-log.md merge=union
 *.sh text eol=lf
 *.ps1 text eol=lf
+
+# Task 00's golden regression baseline is LF-only by construction. Without
+# this, core.autocrlf=true checks it out as CRLF (2045 bytes vs the committed
+# 2000), and task 05's AC1 diff against it fails on every Windows clone for a
+# reason unrelated to billing.
+tests/golden/** -text
+
+# The deploy/ hooks are MDM-pushed to machines whose interpreter (a fleet
+# shebang, or a Windows py launcher) needs the endings below - without this a
+# macOS/Linux fleet machine gets a CRLF shebang line and the hook fails to
+# execute, silently, because it is required to exit 0.
+deploy/*.py text eol=lf

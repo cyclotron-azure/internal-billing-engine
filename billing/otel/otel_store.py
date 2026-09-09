@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS token_usage (
   token_type TEXT,                  -- input | output | cacheRead | cacheCreation
   query_source TEXT,                -- main | subagent | auxiliary
   tokens INTEGER,
-  ingested_at TEXT
+  ingested_at TEXT,
+  usage_source TEXT NOT NULL DEFAULT 'otlp',  -- 'otlp' | 'transcript' (desktop-sourced)
+  entrypoint TEXT                   -- claude-desktop | cli | claude-vscode | ... (transcript rows only)
 );
 CREATE INDEX IF NOT EXISTS ix_token_repo ON token_usage(repo);
 
@@ -46,7 +48,18 @@ CREATE TABLE IF NOT EXISTS cost_usage (
   model TEXT,
   query_source TEXT,
   cost_usd REAL,                    -- Anthropic's actual USD for this datapoint
-  ingested_at TEXT
+  ingested_at TEXT,
+  usage_source TEXT NOT NULL DEFAULT 'otlp',  -- 'otlp' | 'transcript'. MANDATORY here,
+                                    -- not just on token_usage: attribute.py's
+                                    -- resolved_view() is applied to cost_usage at
+                                    -- bill.py:57 and export.py:78, and task 04 adds an
+                                    -- attribution_source branch that references
+                                    -- usage_source -- omitting it here would make that
+                                    -- SQL fail to prepare and kill bill.py / the lake
+                                    -- export outright for the existing OTLP-only fleet.
+  cost_source TEXT NOT NULL DEFAULT 'actual'  -- 'actual' (OTLP claude_code.cost.usage) |
+                                    -- 'rate_card' (desktop transcripts carry no cost
+                                    -- metric, so a rate-card estimate stands in)
 );
 CREATE INDEX IF NOT EXISTS ix_cost_repo ON cost_usage(repo);
 
@@ -140,41 +153,214 @@ def dp_key(session_id, model, token_type, query_source, time_unix_nano) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
+# Transcript (desktop-sourced) dedupe / replay-guard key. Deliberately a
+# SEPARATE function from dp_key above, not an overload of it -- do not fold
+# these two back together.
+#
+# Composition: (session_id, request_id, token_type) -- and nothing else.
+#
+#   - request_id replaces dp_key's time_unix_nano as the disambiguator.
+#     Task 02 emits second-granularity timestamps for transcript rows, so two
+#     desktop assistant messages in the same session/model/second would
+#     otherwise produce an IDENTICAL dp_key and INSERT OR IGNORE would
+#     silently drop the second -- under-billing a paying client with no error
+#     anywhere. Keying on request_id instead makes that collision structurally
+#     impossible regardless of timestamp granularity.
+#   - model is EXCLUDED (unlike dp_key) because a request_id already pins the
+#     record to one API request, which used exactly one model.
+#   - query_source is DELIBERATELY EXCLUDED, unlike dp_key which includes it.
+#     A request_id belongs to exactly one API request, which lives in exactly
+#     one on-disk transcript file, and therefore carries exactly one
+#     query_source (main | subagent | auxiliary) -- measured at 0 collisions
+#     across 314 real request groups. This is a recorded decision, not an
+#     oversight: if that invariant ever breaks, a main-transcript row and a
+#     sidechain row sharing one request_id would collide under this key and
+#     the second insert would be silently dropped by INSERT OR IGNORE.
+#   - This key is a REPLAY GUARD, not a semantic collapse. By the time a
+#     record reaches insert_datapoint / insert_cost_datapoint, task 02 / task
+#     06 have already collapsed each request to its single terminal block
+#     (highest apiBlockIndex) -- so there is exactly one row per
+#     (session_id, request_id, token_type) to begin with. This function only
+#     stops that ONE record from being re-inserted on a re-run; it does not
+#     and cannot choose the right snapshot among several duplicate-request
+#     inserts -- INSERT OR IGNORE keeps whichever lands first (see
+#     insert_datapoint's docstring for why callers must not rely on it for
+#     that).
+#   - The literal "transcript" prefix keeps this key's hash input shape (4
+#     fields, no model, no timestamp) structurally distinct from dp_key's (5
+#     fields, includes model + time_unix_nano) -- a transcript key can never
+#     equal an OTLP dp_key for the same session_id/timestamp.
+#
+# The cost row for a transcript record reuses this same function with the
+# sentinel token_type "__cost__" (identical sentinel to dp_key's OTLP cost
+# key), which never collides with any of a record's four real token rows
+# (input | output | cacheRead | cacheCreation).
+def transcript_key(session_id, request_id, token_type) -> str:
+    raw = f"transcript|{session_id}|{request_id}|{token_type}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _existing_columns(db, table: str) -> set:
+    return {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(db) -> None:
+    """Additive, idempotent migration for pre-task-01 databases.
+
+    Guarded per column by PRAGMA table_info so an already-migrated (or
+    freshly-created, since SCHEMA now declares these columns itself) database
+    is a no-op rather than an error -- a live billing database is in use, and
+    a migration that raises on open takes the receiver down. Never drops,
+    renames, or retypes a column; never rewrites an existing row. Existing
+    rows read back with the column DEFAULT, i.e. usage_source='otlp' and
+    (on cost_usage) cost_source='actual'.
+    """
+    tok_cols = _existing_columns(db, "token_usage")
+    if "usage_source" not in tok_cols:
+        db.execute(
+            "ALTER TABLE token_usage ADD COLUMN usage_source TEXT NOT NULL DEFAULT 'otlp'")
+    if "entrypoint" not in tok_cols:
+        db.execute("ALTER TABLE token_usage ADD COLUMN entrypoint TEXT")
+
+    cost_cols = _existing_columns(db, "cost_usage")
+    if "usage_source" not in cost_cols:
+        db.execute(
+            "ALTER TABLE cost_usage ADD COLUMN usage_source TEXT NOT NULL DEFAULT 'otlp'")
+    if "cost_source" not in cost_cols:
+        db.execute(
+            "ALTER TABLE cost_usage ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'actual'")
+    db.commit()
+
+
 class OtelStore:
     def __init__(self, path: str = DEFAULT_DB):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        _migrate(self.db)
 
     def insert_datapoint(self, *, session_id, repo, repo_raw, user_email, user_id,
                          org_id, model, token_type, query_source, tokens,
-                         time_unix_nano) -> bool:
-        """Returns True if inserted, False if it was a duplicate."""
-        key = dp_key(session_id, model, token_type, query_source, time_unix_nano)
+                         time_unix_nano, usage_source: str = "otlp",
+                         entrypoint=None, request_id=None) -> bool:
+        """Returns True if inserted, False if it was a duplicate.
+
+        `usage_source`, `entrypoint`, and `request_id` are new, keyword-only,
+        and all default to existing OTLP behavior -- every existing caller
+        (billing.otel.receiver) keeps working unchanged.
+
+        Keying: `usage_source == "otlp"` (the default) keys on the unchanged
+        `dp_key(session_id, model, token_type, query_source, time_unix_nano)`.
+        Any other `usage_source` (transcript/desktop-sourced) keys on
+        `transcript_key(session_id, request_id, token_type)` instead -- see
+        that function's docstring for why a separate key is required and how
+        it's composed.
+
+        `request_id` is REQUIRED (raises ValueError if falsy, and the literal
+        string "None" is rejected too -- a client that stringifies a missing
+        id would otherwise collide identically to a true None) whenever
+        `usage_source != "otlp"`. A default of None keying on
+        transcript_key(session_id, None, token_type) would collapse every
+        request in the session to one row per token_type and silently
+        under-bill, with no column anywhere recording the loss -- this is not
+        a hypothetical, it reproduces end to end. Conversely, `usage_source ==
+        "otlp"` REJECTS a non-None `request_id`: a caller that forgets to also
+        pass `usage_source="transcript"` would otherwise still be silently
+        routed onto the timestamp-based dp_key, reintroducing the exact
+        second-granularity collision this task exists to prevent. Raising
+        surfaces that wiring bug immediately instead of a few tokens later
+        under-billing a client.
+        """
+        if usage_source == "otlp":
+            if request_id is not None:
+                raise ValueError(
+                    "request_id must not be passed when usage_source='otlp' -- "
+                    "otlp rows key on dp_key(...,time_unix_nano), not request_id; "
+                    "a non-None request_id here usually means the caller meant to "
+                    "also pass usage_source='transcript', and would otherwise "
+                    "silently key on the timestamp-based dp_key, reintroducing the "
+                    "second-granularity collision this task exists to prevent")
+            key = dp_key(session_id, model, token_type, query_source, time_unix_nano)
+        else:
+            # .strip() BEFORE the falsy check and the "None" comparison:
+            # whitespace-only request_id ("  ") would otherwise pass the
+            # falsy check and collapse every request in a session onto one
+            # key, exactly the original defect just harder to reach; and
+            # inconsistent padding (" req-1 " vs "req-1") would otherwise key
+            # differently and double-insert. Stripping first also catches
+            # " None " under the "None" comparison.
+            stripped_request_id = str(request_id).strip() if request_id is not None else request_id
+            if not stripped_request_id or stripped_request_id == "None":
+                raise ValueError(
+                    "request_id is required when usage_source != 'otlp' -- keying "
+                    "on None (or a blank/whitespace-only string) collapses every "
+                    "request in the session to one row per token_type and silently "
+                    "under-bills")
+            key = transcript_key(session_id, stripped_request_id, token_type)
         cur = self.db.execute(
             """INSERT OR IGNORE INTO token_usage
                (dp_key, ts, session_id, repo, repo_raw, user_email, user_id,
-                org_id, model, token_type, query_source, tokens, ingested_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                org_id, model, token_type, query_source, tokens, ingested_at,
+                usage_source, entrypoint)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (key, _ns_to_iso(time_unix_nano), session_id, repo, repo_raw,
              user_email, user_id, org_id, model, token_type, query_source,
-             int(tokens or 0), _now()))
+             int(tokens or 0), _now(), usage_source, entrypoint))
         return cur.rowcount > 0
 
     def insert_cost_datapoint(self, *, session_id, repo, repo_raw, user_email,
                               user_id, org_id, model, query_source, cost_usd,
-                              time_unix_nano) -> bool:
-        """Returns True if inserted, False if it was a duplicate."""
-        key = dp_key(session_id, model, "__cost__", query_source, time_unix_nano)
+                              time_unix_nano, usage_source: str = "otlp",
+                              cost_source: str = "actual", request_id=None) -> bool:
+        """Returns True if inserted, False if it was a duplicate.
+
+        `usage_source`, `cost_source`, and `request_id` are new, keyword-only,
+        and all default to existing OTLP behavior -- every existing caller
+        keeps working unchanged.
+
+        Keying mirrors insert_datapoint: `usage_source == "otlp"` keys on the
+        unchanged `dp_key(session_id, model, "__cost__", query_source,
+        time_unix_nano)`; any other `usage_source` keys on
+        `transcript_key(session_id, request_id, "__cost__")` -- the same
+        sentinel token_type dp_key uses for OTLP cost rows, so a record's cost
+        row never collides with any of its four token rows under either key
+        function.
+
+        `request_id` validation mirrors insert_datapoint exactly (required and
+        non-"None"-string for non-otlp calls; rejected for otlp calls) -- see
+        that method's docstring for why both directions raise.
+        """
+        if usage_source == "otlp":
+            if request_id is not None:
+                raise ValueError(
+                    "request_id must not be passed when usage_source='otlp' -- "
+                    "otlp rows key on dp_key(...,time_unix_nano), not request_id; "
+                    "a non-None request_id here usually means the caller meant to "
+                    "also pass usage_source='transcript', and would otherwise "
+                    "silently key on the timestamp-based dp_key, reintroducing the "
+                    "second-granularity collision this task exists to prevent")
+            key = dp_key(session_id, model, "__cost__", query_source, time_unix_nano)
+        else:
+            # See insert_datapoint for why .strip() runs before the falsy /
+            # "None" check (whitespace-only ids and inconsistent padding).
+            stripped_request_id = str(request_id).strip() if request_id is not None else request_id
+            if not stripped_request_id or stripped_request_id == "None":
+                raise ValueError(
+                    "request_id is required when usage_source != 'otlp' -- keying "
+                    "on None (or a blank/whitespace-only string) collapses every "
+                    "request in the session to one row per token_type and silently "
+                    "under-bills")
+            key = transcript_key(session_id, stripped_request_id, "__cost__")
         cur = self.db.execute(
             """INSERT OR IGNORE INTO cost_usage
                (dp_key, ts, session_id, repo, repo_raw, user_email, user_id,
-                org_id, model, query_source, cost_usd, ingested_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                org_id, model, query_source, cost_usd, ingested_at,
+                usage_source, cost_source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (key, _ns_to_iso(time_unix_nano), session_id, repo, repo_raw,
              user_email, user_id, org_id, model, query_source,
-             float(cost_usd or 0), _now()))
+             float(cost_usd or 0), _now(), usage_source, cost_source))
         return cur.rowcount > 0
 
     # ---- session -> repo timeline (fed by the CwdChanged hook) ---------

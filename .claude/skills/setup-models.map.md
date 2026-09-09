@@ -3,9 +3,6 @@
 Model IDs are **configuration, not constants**. This file is the single place they are
 defined; re-run `/setup` (or edit here and re-emit) when providers rotate model names.
 
-Installed harness: **Claude Code only**. Columns for Cursor, Copilot, and Codex were
-removed at setup time — re-run `/setup` and target those harnesses to restore them.
-
 ## Tier assignments
 
 | Tier | Roles | Rationale |
@@ -17,18 +14,19 @@ removed at setup time — re-run `/setup` and target those harnesses to restore 
 
 | Tier | Claude Code |
 |------|-------------|
-| `frontier` | `claude-opus-5` |
-| `light` | `claude-sonnet-5` |
+| `frontier` | claude-opus-5 |
+| `light` | claude-sonnet-5 |
 
 Reasoning-effort pins: evaluators `high`, workers `medium` — set as Claude Code
-`effort:` frontmatter in each agent file.
+`effort:` frontmatter in each agent file. Claude Code is the only targeted harness, so
+the Copilot, Codex, and Cursor effort encodings do not apply here.
 
 ## Fallback chains
 
 | Tier | Chain (first available wins) |
 |------|------------------------------|
-| `frontier` | `claude-opus-5` -> `claude-sonnet-5` -> (omit pin — harness default) |
-| `light` | `claude-sonnet-5` -> `claude-haiku-4-5-20251001` -> (omit pin — harness default) |
+| `frontier` | `claude-opus-5` → `claude-sonnet-5` → (omit pin — harness default) |
+| `light` | `claude-sonnet-5` → `claude-haiku-4-5-20251001` → (omit pin — harness default) |
 
 Rules (adapted from bradygaster/squad's model selector):
 
@@ -37,17 +35,23 @@ Rules (adapted from bradygaster/squad's model selector):
 - Fallbacks are silent to the user but **logged in the orchestration log**.
 - Max 3 fallback attempts, then omit the model pin and take the harness default.
 - Apply at most **one** complexity adjustment per spawn — no cascading bumps.
-- **Cost ceiling policy**: an EXPLICIT human model choice above a plan/admin ceiling ->
-  warn loudly and honor it; an implicit (auto-selected) choice -> downgrade to the
-  ceiling; no compliant model at all -> fail loud — never silently substitute.
-- **Prompts are executable — treat like code**: tasks that author or edit agent, skill,
-  or prompt files use the frontier tier, never the docs/light tier.
+- **Cost ceiling policy**: an EXPLICIT human model choice above a plan/admin ceiling →
+  warn loudly and honor it; an implicit (auto-selected) choice → downgrade to the
+  ceiling; no compliant model at all → fail loud — never silently substitute.
+- **Prompts are executable — narrowly**: only tasks that edit `templates/agents/*`
+  or `templates/skills/*-criteria/*` (the files that shape every later spawn's
+  behavior) use the frontier tier; skills, emitters, drivers, docs, and tests stay
+  on the light tier.
+- **Every spawn names its model.** The orchestrator passes the tier's resolved ID
+  explicitly on every spawn and records `requested` vs the agent's self-reported
+  model in the orchestration log; `inherit` is legitimate only for a tier the
+  install deliberately left unpinned.
 
 ### Loop fallback chain
 
 | Chain (first available wins) | Resolves |
 |-------------------------------|----------|
-| `claude-sonnet-5` -> `claude-haiku-4-5-20251001` -> (omit pin — harness default) | `claude-sonnet-5,claude-haiku-4-5-20251001` |
+| `claude-sonnet-5` → `claude-haiku-4-5-20251001` → (omit pin — harness default) | `claude-sonnet-5,claude-haiku-4-5-20251001` |
 
 Light-tier by default — the loop's iterations are implementer/test-writer-shaped work,
 same as the `light` row above. Ends with the same omit-the-pin rule as the tables
