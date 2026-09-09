@@ -3,3 +3,11 @@
 # (Git usually auto-detects binary content, but for a file developers download
 # and run, being explicit is worth the one line.)
 *.zip binary
+
+# Orchestration kit: append-only loop state merges cleanly in parallel runs,
+# and the loop drivers must check out with the endings their interpreters need.
+_goals/LEARNINGS.md merge=union
+_goals/ESCALATIONS.md merge=union
+_goals/*/orchestration-log.md merge=union
+*.sh text eol=lf
+*.ps1 text eol=lf

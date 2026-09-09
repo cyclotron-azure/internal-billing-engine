@@ -25,3 +25,8 @@ venv/
 invoices/
 exports/
 otel-data/
+
+# Orchestration kit — loop runtime scratch (never commit)
+_goals/breaker-state.json
+_goals/breaker-state.json.tmp.*
+.loop-worktrees/

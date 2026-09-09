@@ -1,0 +1,46 @@
+{
+  "kit": "ai-orchestration",
+  "kitVersion": "0.23.0",
+  "installedAt": "2026-09-03",
+  "harnesses": [
+    "claude-code"
+  ],
+  "options": {
+    "research": false,
+    "loop": true,
+    "greenfield": false,
+    "forge": "github"
+  },
+  "files": {
+    ".claude/ORCHESTRATION.md": "32bec13236e6c01b28197e4ec754e29c5fdd154d579b4e95080909445ad54461",
+    ".claude/agents/diagnostician.md": "f1cc48ab2a23469e42d04c8f0574525652b2c31700489a8754322000310917ce",
+    ".claude/agents/evaluator.md": "7fced0773e7f15abb3f5ce8f5d1120a06eca7d734843582ab19ae3b0f0413ba6",
+    ".claude/agents/implementer.md": "4db87c0beed8914294dedc3b60c31c3aac6a0e672f3400f537a8670f30b6b566",
+    ".claude/agents/qa-evaluator.md": "45a1b4b7acd4d29978f1cec1ef671c6c3e6427bd68e262700dcb18e64052fc9f",
+    ".claude/agents/terminal.md": "f56fcf8ef1e82a29c729f7de99a3f1621abf83f97e86232adb034c598831dc8c",
+    ".claude/agents/test-writer.md": "1f53c30eaf57f71ae9dce31385878a4ba09b9146622e2e3b0872a1e50f0b7987",
+    ".claude/settings.json": "a3fb9ca4fc62ecb39c7d8e0b7b88d05fbfd8a3c046df8e344ff82e3f8c381ae4",
+    ".claude/skills/align-docs/SKILL.md": "2c8f3ba628e459008ebb4722e004c9e84ed8cac415ca26a276abe96d30651f6a",
+    ".claude/skills/auto-loop/SKILL.md": "fe7362b06b9db9b235ad1d220b04fa2bbf595782df232f7a8d4caf34d541ca97",
+    ".claude/skills/feature/SKILL.md": "117fc815b0201a378ccae93ca7c7e49022dbb1c1c4102bbd82663fc2f0d0f92e",
+    ".claude/skills/feature/reference/continuation-ladder.md": "ce11f42ae86c683bcc464c7f55a51783721d0e753692e2739fca94d0ceb4ec27",
+    ".claude/skills/feature/templates/goal.md": "40d440d64580bdc8ed0f7e33664acfc9a90ff693929e8e6d54595db77494be35",
+    ".claude/skills/feature/templates/task.md": "677f0aba8e4d3bfd2a61ffd78c30c184fad46da362583f7ab6f016c5d62526ae",
+    ".claude/skills/goal-criteria/SKILL.md": "28bbc9c2ac315344af5b48b7fa846ff9b6793da7217a3b7c44395fc49b6bf14f",
+    ".claude/skills/qa-criteria/SKILL.md": "412cde2fb07e1e7e2490cc9a3b590b13f42f30713b700f98ae1af0130f237168",
+    ".claude/skills/setup-models.map.md": "b636301e0b6dbc9e4922402429efb57923197d77d7e96eb21271e6a7576120a9",
+    ".claude/skills/ship-pr/SKILL.md": "43188047032ec2a1ca5c9bd44ee18779ecca7b2a1458717c87b723e63f500da4",
+    ".claude/skills/task-criteria/SKILL.md": "e0bfbd4a34e01a32942ff483e566999c75739cf46bdfd745c36884980da8e4fd",
+    ".claude/skills/test-ladder/SKILL.md": "1cf42a3fd5d0b81b0d506c651b90f2f4ebe3615b2a1ebc4f22148b3430194548",
+    "CLAUDE.md": "71a5d970c1c618730e0531df48e3db4431f3ae4b2014671653e8f9286f0c547c",
+    "_goals/backlog.md": "a5e29043e0d6456302c5ce3848514ebdd291d8e1490114aaf6eb036c9ae3ffd2",
+    "_loop/PROMPT.md": "c236fe62660fc5f5110f11d13348138358ee6429659687431b2aab035c4f0cf4",
+    "_loop/breaker.ps1": "9de904697651bf99c411c84c0c8fb095ab9190b9b43cd8cbb7169e6b01ed8f49",
+    "_loop/breaker.sh": "dcdb6aa61f07d1077e0cb7177142bd6443d6dfc3b48b8dcafba825b13ffa47f9",
+    "_loop/loop.ps1": "ff4ea1fef218d3bc6a3e015e9811c27acb0889f95554b43abe8fa16749dcacdb",
+    "_loop/loop.sh": "166d0da2af26223bb778a2f2b38fee655f5634ac4689fdd383c81fbf04305d79"
+  },
+  "seedFiles": [
+    "_goals/backlog.md"
+  ]
+}
