@@ -57,12 +57,39 @@ CONFIG_NAME = "billing-config.json"
 # precisely the latency ASYNC_EVENTS below exists to keep off the critical
 # path. Generalizing this to a per-hook map (instead of one shared tuple) is
 # what makes that distinction expressible at all.
+# claude-transcript-usage.py is DELIBERATELY NOT REGISTERED (2026-09-10).
+# It was built to capture desktop-app usage the OTLP exporter was believed not
+# to emit. Measured on a live receiver, that premise is false: a desktop session
+# run against a LOCAL folder exports OTLP exactly like the CLI, because the
+# desktop app reads the same ~/.claude/settings.json env block this installer
+# writes. Session f315633b arrived twice -- 1,066,833 tokens via `otlp` and
+# 850,966 via `transcript` -- and bill.py's double-billing detector flagged it.
+# Enrolment is what configures OTLP, so on any machine where this hook would be
+# installed, it is redundant by construction and inflates the invoice.
+# The hook itself is kept in the repo (deploy/claude-transcript-usage.py) for
+# the case it was designed for: a machine that runs Claude Code WITHOUT OTLP
+# configured. Re-add the entry below to ship it. Cloud-executed desktop sessions
+# write no local transcript at all and are out of its reach either way -- those
+# are covered by the Analytics reconciliation residual instead.
 HOOK_EVENTS_BY_FILE = {
     "claude-repo-tag.py": ("SessionStart", "CwdChanged", "DirectoryAdded",
                            "SessionEnd", "UserPromptSubmit"),
-    "claude-transcript-usage.py": ("SessionEnd",),
 }
 HOOK_FILES = tuple(HOOK_EVENTS_BY_FILE.keys())
+
+# Hooks this installer USED to ship and must now actively remove. Dropping a
+# name out of HOOK_EVENTS_BY_FILE stops it being installed, but it does NOT
+# uninstall it from a machine that already has it -- the cleanup loops iterate
+# the hooks we know about, so a forgotten hook becomes invisible to the very
+# code meant to remove it, and keeps running forever. (Observed exactly that
+# during the 1.2.1 -> 1.3.0 change.) Anything retired here stays listed so
+# install and uninstall both strip it.
+RETIRED_HOOK_FILES = (
+    "claude-transcript-usage.py",   # retired 2026-09-10, see note above
+)
+
+# Every hook name cleanup must consider: what we ship now, plus what we retired.
+CLEANUP_HOOK_FILES = HOOK_FILES + RETIRED_HOOK_FILES
 
 # UserPromptSubmit re-tags on every prompt so a single missed delivery
 # self-heals; async so a slow receiver never adds latency to a prompt. Only
@@ -361,7 +388,7 @@ def apply_config(obj: dict, endpoint: str, token: str) -> dict:
     # Strip both hooks' prior entries first (idempotent re-install), THEN
     # register each on its own event set - a hook removed from one machine's
     # settings must never leave the other hook's entries behind either.
-    for hook_name in HOOK_FILES:
+    for hook_name in CLEANUP_HOOK_FILES:
         strip_our_hooks(hooks, hook_path(hook_name))
     for hook_name, events in HOOK_EVENTS_BY_FILE.items():
         cmd = hook_command(hook_name)
@@ -500,6 +527,17 @@ def cmd_install(args) -> int:
         return 0
 
     os.makedirs(hook_dir(), exist_ok=True)
+
+    # Delete retired hooks left behind by an older version of this package.
+    # Their registrations are stripped above, but an orphaned .py sitting in
+    # the hook dir is confusing to anyone debugging later, and would run again
+    # the moment someone re-added a registration by hand.
+    for hook_name in RETIRED_HOOK_FILES:
+        stale = hook_path(hook_name)
+        if os.path.exists(stale):
+            os.remove(stale)
+            print("    removed retired hook -> %s" % stale)
+
     for hook_name, src in srcs.items():
         dest = hook_path(hook_name)
         shutil.copy2(src, dest)
@@ -558,7 +596,7 @@ def cmd_uninstall(args) -> int:
         hooks = obj.get("hooks")
         removed_hooks = 0
         if isinstance(hooks, dict):
-            for hook_name in HOOK_FILES:
+            for hook_name in CLEANUP_HOOK_FILES:
                 removed_hooks += strip_our_hooks(hooks, hook_path(hook_name))
             if not hooks:
                 obj.pop("hooks", None)
@@ -571,7 +609,7 @@ def cmd_uninstall(args) -> int:
     else:
         print("  no %s - nothing to clean" % path)
 
-    for hook_name in HOOK_FILES:
+    for hook_name in CLEANUP_HOOK_FILES:
         dest = hook_path(hook_name)
         if os.path.exists(dest):
             if not args.dry_run:

@@ -55,7 +55,9 @@ CONTENTS = (
     "install.ps1",
     "configure.py",
     "claude-repo-tag.py",
-    "claude-transcript-usage.py",
+    # claude-transcript-usage.py is deliberately NOT shipped -- see the comment
+    # on HOOK_EVENTS_BY_FILE in configure.py. Local desktop usage already
+    # arrives via OTLP; shipping this hook double-bills it.
     "VERSION",
 )
 

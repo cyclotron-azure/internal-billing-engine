@@ -78,11 +78,17 @@ def _events_for(hooks: dict, needle: str) -> set:
 # AC13 (client-package side): per-hook event map
 # ---------------------------------------------------------------------------
 
-def test_apply_config_registers_transcript_hook_on_session_end_only(configure):
+def test_apply_config_does_not_register_retired_transcript_hook(configure):
+    # claude-transcript-usage.py was retired 2026-09-10: enrolment configures
+    # OTLP, which a desktop session against a local folder already exports
+    # identically to the CLI, so shipping/registering this hook double-bills
+    # (see session f315633b: 1,066,833 'otlp' tokens + 850,966 'transcript'
+    # tokens for the same session). It must never be installed again by
+    # apply_config -- do not "restore" this assertion.
     obj = {}
     configure.apply_config(obj, "https://receiver.example.internal:4318", "T" * 32)
     events = _events_for(obj["hooks"], "claude-transcript-usage.py")
-    assert events == {"SessionEnd"}
+    assert events == set()
 
 
 def test_apply_config_keeps_repo_tag_on_all_five_events(configure):
@@ -102,11 +108,18 @@ def test_apply_config_repo_tag_stays_async_on_user_prompt_submit(configure):
 
 
 def test_hook_events_by_file_is_a_real_per_hook_map(configure):
-    # Mutation guard for "generalize a shared tuple into a per-hook map":
-    # a shared HOOK_EVENTS tuple could not express two different event sets.
-    assert configure.HOOK_EVENTS_BY_FILE["claude-transcript-usage.py"] != \
-        configure.HOOK_EVENTS_BY_FILE["claude-repo-tag.py"]
-    assert set(configure.HOOK_FILES) == {"claude-repo-tag.py", "claude-transcript-usage.py"}
+    # Mutation guard for "the map is genuinely per-hook, not one shared
+    # tuple": each entry's event set is independently defined, so adding a
+    # second hook with a different event set (as transcript-usage once was)
+    # is expressible. Only one hook ships today, so we assert the map's shape
+    # rather than compare two entries that no longer both exist.
+    assert set(configure.HOOK_EVENTS_BY_FILE["claude-repo-tag.py"]) == set(ALL_FIVE_EVENTS)
+    assert isinstance(configure.HOOK_EVENTS_BY_FILE, dict)
+    assert set(configure.HOOK_FILES) == {"claude-repo-tag.py"}
+    # the retired hook is tracked for cleanup but is NOT a shipped hook file
+    assert "claude-transcript-usage.py" not in configure.HOOK_FILES
+    assert configure.RETIRED_HOOK_FILES == ("claude-transcript-usage.py",)
+    assert set(configure.CLEANUP_HOOK_FILES) == {"claude-repo-tag.py", "claude-transcript-usage.py"}
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +151,8 @@ def test_install_then_uninstall_round_trips_settings(tmp_path, monkeypatch, conf
     assert mid["theme"] == starting["theme"]
     # the pre-existing, unrelated hook registration survives the merge
     assert mid["hooks"]["Notification"] == starting["hooks"]["Notification"]
-    assert _events_for(mid["hooks"], "claude-transcript-usage.py") == {"SessionEnd"}
+    # the retired hook is never (re-)registered by a fresh install
+    assert _events_for(mid["hooks"], "claude-transcript-usage.py") == set()
     assert _events_for(mid["hooks"], "claude-repo-tag.py") == set(ALL_FIVE_EVENTS)
 
     rc2 = configure.cmd_uninstall(argparse.Namespace(dry_run=False))
@@ -176,13 +190,154 @@ def test_reinstall_is_idempotent_no_duplicate_entries(tmp_path, monkeypatch, con
     obj, _ = configure.read_settings(str(tmp_path / ".claude" / "settings.json"))
     hooks = obj["hooks"]
     # exactly one registration per event per hook, not two
-    session_end_transcript_cmds = [
+    session_end_repo_tag_cmds = [
         h["command"]
         for group in hooks["SessionEnd"]
         for h in group["hooks"]
-        if "claude-transcript-usage.py" in h["command"].replace("\\", "/")
+        if "claude-repo-tag.py" in h["command"].replace("\\", "/")
     ]
-    assert len(session_end_transcript_cmds) == 1
+    assert len(session_end_repo_tag_cmds) == 1
+
+
+# ---------------------------------------------------------------------------
+# Retirement mechanism: RETIRED_HOOK_FILES / CLEANUP_HOOK_FILES.
+#
+# Dropping a hook out of HOOK_EVENTS_BY_FILE stops it being installed, but
+# does NOT uninstall it from a machine that already has it -- the cleanup
+# loops (strip-before-register in apply_config, and both loops in
+# cmd_uninstall) iterate the hooks the code currently knows how to ship.
+# Without RETIRED_HOOK_FILES feeding into CLEANUP_HOOK_FILES, a retired hook
+# becomes invisible to the very code meant to remove it and keeps running
+# forever on any machine that installed it before the retirement. This is
+# exactly the bug hit during the 1.2.1 -> 1.3.0 change (claude-transcript-
+# usage.py silently surviving on already-enrolled machines).
+# ---------------------------------------------------------------------------
+
+def _seed_legacy_registration(settings_file, configure, events=("SessionEnd",)):
+    """Write a settings.json registering claude-transcript-usage.py, as a
+    1.2.1 install would have left it, without going through today's
+    apply_config (which no longer knows how to write that registration)."""
+    hooks = {}
+    cmd = configure.hook_command("claude-transcript-usage.py")
+    for event in events:
+        hooks[event] = [{"hooks": [{"type": "command", "command": cmd}]}]
+    settings_file.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+
+
+def test_install_strips_retired_hook_registration(tmp_path, monkeypatch, configure):
+    monkeypatch.setattr(configure, "home", lambda: str(tmp_path))
+    monkeypatch.setattr(configure, "verify", lambda endpoint, token, timeout=5.0: True)
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir(parents=True)
+    settings_file = settings_dir / "settings.json"
+    _seed_legacy_registration(settings_file, configure)
+
+    rc = configure.cmd_install(_install_args())
+    assert rc == 0
+
+    obj, _ = configure.read_settings(str(settings_file))
+    assert _events_for(obj["hooks"], "claude-transcript-usage.py") == set(), (
+        "a pre-existing registration of the retired hook must be stripped on install")
+    assert _events_for(obj["hooks"], "claude-repo-tag.py") == set(ALL_FIVE_EVENTS)
+
+
+def test_install_deletes_retired_hook_file(tmp_path, monkeypatch, configure):
+    monkeypatch.setattr(configure, "home", lambda: str(tmp_path))
+    monkeypatch.setattr(configure, "verify", lambda endpoint, token, timeout=5.0: True)
+    (tmp_path / ".claude").mkdir(parents=True)
+    hook_dir = tmp_path / ".cyclotron"
+    hook_dir.mkdir(parents=True)
+    stale = hook_dir / "claude-transcript-usage.py"
+    stale.write_text("# leftover 1.2.1 hook\n", encoding="utf-8")
+
+    rc = configure.cmd_install(_install_args())
+    assert rc == 0
+
+    assert not stale.exists(), (
+        "a retired hook's on-disk file must be deleted on install, not just "
+        "unregistered, or it keeps running the moment it is re-registered")
+    assert os.path.exists(configure.hook_path("claude-repo-tag.py"))
+
+
+def test_uninstall_removes_retired_hook_registration_and_file(tmp_path, monkeypatch, configure):
+    monkeypatch.setattr(configure, "home", lambda: str(tmp_path))
+    monkeypatch.setattr(configure, "verify", lambda endpoint, token, timeout=5.0: True)
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir(parents=True)
+    settings_file = settings_dir / "settings.json"
+    hook_dir_path = tmp_path / ".cyclotron"
+    hook_dir_path.mkdir(parents=True)
+
+    # Seed a machine that carries BOTH the current hook's registration and
+    # the retired hook's registration, written directly (not through
+    # apply_config, which would already strip the retired one on its own --
+    # that would make this test pass without cmd_uninstall doing anything).
+    repo_tag_cmd = configure.hook_command("claude-repo-tag.py")
+    transcript_cmd = configure.hook_command("claude-transcript-usage.py")
+    hooks = {event: [{"hooks": [{"type": "command", "command": repo_tag_cmd}]}]
+             for event in ALL_FIVE_EVENTS}
+    hooks["SessionEnd"].append({"hooks": [{"type": "command", "command": transcript_cmd}]})
+    settings_file.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+    assert _events_for(json.loads(settings_file.read_text())["hooks"],
+                        "claude-transcript-usage.py") == {"SessionEnd"}, \
+        "seed did not actually land the retired hook's registration"
+
+    (hook_dir_path / "claude-repo-tag.py").write_text("# copy\n", encoding="utf-8")
+    stale = hook_dir_path / "claude-transcript-usage.py"
+    stale.write_text("# leftover 1.2.1 hook\n", encoding="utf-8")
+    assert stale.exists()
+
+    rc = configure.cmd_uninstall(argparse.Namespace(dry_run=False))
+    assert rc == 0
+
+    assert not stale.exists(), "uninstall must delete the retired hook's file too"
+    final, existed = configure.read_settings(str(settings_file))
+    final_hooks = final.get("hooks", {}) if existed else {}
+    assert _events_for(final_hooks, "claude-transcript-usage.py") == set(), (
+        "uninstall must strip the retired hook's registration too")
+    assert _events_for(final_hooks, "claude-repo-tag.py") == set()
+
+
+def test_upgrade_from_1_2_1_round_trips_to_exact_new_state(tmp_path, monkeypatch, configure):
+    """A machine that installed the old two-hook 1.2.1 package, upgrading to
+    the current package, must end up in EXACTLY today's state: the retired
+    hook gone (file + registration), and only claude-repo-tag.py present."""
+    monkeypatch.setattr(configure, "home", lambda: str(tmp_path))
+    monkeypatch.setattr(configure, "verify", lambda endpoint, token, timeout=5.0: True)
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir(parents=True)
+    settings_file = settings_dir / "settings.json"
+    hook_dir = tmp_path / ".cyclotron"
+    hook_dir.mkdir(parents=True)
+
+    # Seed the full 1.2.1 state: both hook files on disk, both registered
+    # (claude-repo-tag.py on all five events, claude-transcript-usage.py on
+    # SessionEnd only -- the old contract).
+    (hook_dir / "claude-repo-tag.py").write_text("# old repo-tag copy\n", encoding="utf-8")
+    (hook_dir / "claude-transcript-usage.py").write_text("# old transcript copy\n", encoding="utf-8")
+    old_cmd_repo = configure.hook_command("claude-repo-tag.py")
+    old_cmd_transcript = configure.hook_command("claude-transcript-usage.py")
+    hooks = {event: [{"hooks": [{"type": "command", "command": old_cmd_repo}]}]
+             for event in ALL_FIVE_EVENTS}
+    hooks["SessionEnd"].append({"hooks": [{"type": "command", "command": old_cmd_transcript}]})
+    settings_file.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+
+    rc = configure.cmd_install(_install_args())
+    assert rc == 0
+
+    # Retired hook: gone from disk and from settings, on both fronts.
+    assert not (hook_dir / "claude-transcript-usage.py").exists()
+    obj, _ = configure.read_settings(str(settings_file))
+    assert _events_for(obj["hooks"], "claude-transcript-usage.py") == set()
+    # Current hook: present on disk, registered on exactly its five events,
+    # exactly once each (upgrade must not stack a duplicate registration
+    # alongside the old claude-repo-tag.py entry that was already there).
+    assert (hook_dir / "claude-repo-tag.py").exists()
+    assert _events_for(obj["hooks"], "claude-repo-tag.py") == set(ALL_FIVE_EVENTS)
+    for event in ALL_FIVE_EVENTS:
+        cmds = [h["command"] for group in obj["hooks"][event] for h in group["hooks"]
+                if "claude-repo-tag.py" in h["command"].replace("\\", "/")]
+        assert len(cmds) == 1, "event %s has %d claude-repo-tag.py entries, want 1" % (event, len(cmds))
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +359,7 @@ def test_verify_hooks_installed_fails_when_a_hook_file_is_missing(tmp_path, monk
     (tmp_path / ".claude").mkdir(parents=True)
 
     configure.cmd_install(_install_args())
-    os.remove(configure.hook_path("claude-transcript-usage.py"))
+    os.remove(configure.hook_path("claude-repo-tag.py"))
 
     assert configure.verify_hooks_installed() is False
 
@@ -217,7 +372,7 @@ def test_verify_hooks_installed_fails_when_registration_missing(tmp_path, monkey
     configure.cmd_install(_install_args())
     # strip the registration but leave the file on disk
     obj, _ = configure.read_settings(str(tmp_path / ".claude" / "settings.json"))
-    configure.strip_our_hooks(obj["hooks"], configure.hook_path("claude-transcript-usage.py"))
+    configure.strip_our_hooks(obj["hooks"], configure.hook_path("claude-repo-tag.py"))
     configure.write_settings(str(tmp_path / ".claude" / "settings.json"), obj)
 
     assert configure.verify_hooks_installed() is False
@@ -292,8 +447,14 @@ def build_module():
             pass
 
 
-def test_build_contents_includes_transcript_hook(build_module):
-    assert "claude-transcript-usage.py" in build_module.CONTENTS
+def test_build_contents_excludes_retired_transcript_hook(build_module):
+    # claude-transcript-usage.py is deliberately NOT shipped (retired
+    # 2026-09-10): OTLP already captures desktop-app usage on any machine
+    # this installer configures, so shipping the hook double-bills sessions.
+    # Do not "restore" it to CONTENTS -- see configure.HOOK_EVENTS_BY_FILE's
+    # comment for the incident that caused the retirement.
+    assert "claude-transcript-usage.py" not in build_module.CONTENTS
+    assert "claude-repo-tag.py" in build_module.CONTENTS
 
 
 def test_build_contents_files_all_exist_on_disk(build_module):
