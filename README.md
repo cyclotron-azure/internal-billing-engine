@@ -84,6 +84,38 @@ so a `claude` session in this repo produces real rows. `deploy/dev-selftest.sh` 
 the same as a one-off launcher without changing your settings. Telemetry starts with
 the **next** session, and exports every 60s — so give it a minute before checking.
 
+### Wipe what the receiver has collected (start a clean set)
+
+Pilot data you don't want to keep — clear the store and watch the next batch land
+on its own. `purge` counts first and deletes nothing without `--yes`:
+
+```bash
+python3 -m billing.otel.purge                  # dry run: what WOULD be deleted
+python3 -m billing.otel.purge --yes --log      # delete it, and empty receiver.log
+```
+
+Against the Docker receiver, run it **on the host** over the mounted volume — the
+`billing/` copy inside a running container is whatever the image was built with:
+
+```bash
+docker compose stop receiver sync
+OTEL_DB=./otel-data/otel.db python3 -m billing.otel.purge --yes --log
+docker compose start receiver sync
+```
+
+It clears the received datapoints (`token_usage`, `cost_usage`) and the
+session→repo timeline, plus everything derived from them (persisted invoices,
+line items, the `fabric_outbox` delivery queue). The optional repo→billing-name
+overrides are config, not received data, so they survive — add `--all` to drop
+those too. The schema stays in place, so a receiver that is still running keeps
+ingesting into the emptied store with no restart.
+
+Two things live outside the store and are **not** touched: files already written
+under `invoices/` and `exports/`, and anything the sync worker already uploaded
+to ADLS Gen2 / OneLake. The lake tables are rebuilt in full from the store and
+overwritten on every sync, so the next sync after a purge replaces them with the
+post-purge data.
+
 ---
 
 ## 1: Receiving telemetry data
@@ -154,6 +186,7 @@ Shared:
 - **`invoice.py`** — generates per-repo invoices for a billing period: persists immutable invoice + line-item records and writes a human-readable `.txt` invoice + `summary.csv` / `line_items.csv` under `invoices/`. `python -m billing.otel.invoice --start 2026-07-01 --end 2026-08-01`
 - **`records.py`** — dumps individual usage records with their repo tag + resolved billing name.
 - **`sample_payload.py`** — generates a synthetic OTLP payload to exercise the pipeline without live machines.
+- **`purge.py`** — empties the store so a fresh batch of telemetry can be tested: clears received datapoints + the session→repo timeline and everything derived from them (invoices, line items, the delivery outbox), keeping the schema so a live receiver needs no restart. Counts first; deletes only with `--yes`. `python -m billing.otel.purge` (`--db`, `--yes`, `--all`, `--log`, `--keep-invoices`)
 
 **Data-lake sync (asynchronous):**
 - **`fabric_client.py`** — uploads a file to **ADLS Gen2** (or **OneLake**) via the ADLS Gen2 DFS REST API; Entra service-principal / managed-identity / SAS auth (stdlib only). Idempotent overwrite (create → append → flush).
