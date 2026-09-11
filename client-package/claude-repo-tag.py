@@ -79,7 +79,12 @@ def main() -> int:
         # land inside the same second.
         "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "seq": now.microsecond // 1000,
-        "cwd": cwd,
+        # `cwd` is resolved to a git remote HERE and deliberately not sent.
+        # INSTRUCTIONS.md and the installer's consent notice both promise no
+        # file paths leave the machine, and a working directory is one: it
+        # carries the developer's home path and the names of local, often
+        # unrelated, project folders. repo_raw is everything attribution needs
+        # (see billing/otel/attribute.py). Do not add it back.
         "repo_raw": git_remote(cwd),
         "event": event,
         # Subagents can run in a different directory than the main loop; keep

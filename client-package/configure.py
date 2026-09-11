@@ -43,7 +43,6 @@ import re
 import shutil
 import stat
 import sys
-import time
 import urllib.error
 import urllib.request
 
@@ -273,12 +272,73 @@ def write_settings(path: str, obj) -> None:
     os.replace(tmp, path)
 
 
+BACKUP_SUFFIX = ".bak"
+# Shape of the per-run backups this installer wrote before 1.2.0. Matched so
+# they can be cleaned up rather than left lying around.
+LEGACY_BACKUP_RE = re.compile(r"\.bak-\d{8}-\d{6}$")
+
+
+def our_backups(path: str) -> list:
+    """Backup files of `path` that THIS installer created.
+
+    Deliberately narrow: the rolling `.bak`, plus the old timestamped
+    `.bak-YYYYmmdd-HHMMSS` form. A developer's own `settings.json.backup` or
+    `.bak.keep` is none of our business and must survive.
+    """
+    d = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    return [os.path.join(d, n) for n in names
+            if n == base + BACKUP_SUFFIX
+            or (n.startswith(base + ".bak-") and LEGACY_BACKUP_RE.search(n))]
+
+
 def backup_settings(path: str) -> str:
+    """Copy settings.json aside to ONE rolling file, pruning older copies.
+
+    A backup contains CLAUDE_BILLING_TOKEN. The previous timestamped-per-run
+    scheme therefore left another copy of the shared credential on disk after
+    every install AND every uninstall, with nothing ever removing them - so the
+    command a developer runs to get rid of the token kept depositing new copies
+    of it. One rolling backup covers what a backup is actually for here:
+    recovering from a write that fails halfway.
+    """
     if not os.path.exists(path):
         return ""
-    dest = "%s.bak-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+    dest = path + BACKUP_SUFFIX
     shutil.copy2(path, dest)
+    if os.name == "posix":
+        # copy2 carries settings.json's mode across, which is commonly 0644.
+        # This file holds a live token; keep it to the owner.
+        os.chmod(dest, stat.S_IRUSR | stat.S_IWUSR)
+    for old in our_backups(path):
+        if os.path.abspath(old) != os.path.abspath(dest):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
     return dest
+
+
+def remove_backups(path: str) -> list:
+    """Delete the backups this installer made. Returns the paths removed.
+
+    Run at the END of a successful uninstall. write_settings is atomic, so once
+    it has landed there is nothing left to recover - and the backup would
+    otherwise be the last file on disk still holding the token that the
+    uninstall exists to remove.
+    """
+    gone = []
+    for p in our_backups(path):
+        try:
+            os.remove(p)
+            gone.append(p)
+        except OSError:
+            pass
+    return gone
 
 
 def strip_our_hooks(hooks: dict, hook_file: str) -> int:
@@ -444,6 +504,8 @@ def cmd_install(args) -> int:
         bak = backup_settings(path)
         print("  backed up existing settings -> %s" % bak)
         print("  merging (your other settings are preserved)")
+        print("  (one rolling backup; the uninstaller deletes it, because it")
+        print("   holds a copy of the token)")
     else:
         print("  creating a new settings.json")
     apply_config(obj, endpoint, token)
@@ -499,6 +561,17 @@ def cmd_uninstall(args) -> int:
             print("  wrote %s" % path)
     else:
         print("  no %s - nothing to clean" % path)
+
+    # After the clean write has landed, not before: the backup is only insurance
+    # against that write failing. Left in place it would be the last file still
+    # holding the token this uninstall just removed. Runs even when there was no
+    # settings.json, so backups left by older versions get cleared too.
+    if not args.dry_run:
+        for p in remove_backups(path):
+            print("  removed backup %s (it still held the token)" % p)
+    elif our_backups(path):
+        print("  would remove %d backup(s) holding the token"
+              % len(our_backups(path)))
 
     if os.path.exists(hook_path()):
         if not args.dry_run:

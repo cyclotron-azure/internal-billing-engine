@@ -77,6 +77,11 @@ It does **not** collect your prompts, your code, file contents, or file paths.
 None of that is in Claude Code's telemetry, and this ships metrics only — event
 logs are not exported.
 
+"No file paths" includes the directory you are working in. The hook reads it on
+your machine to look up that repo's git remote, and sends only the remote — so
+the name of the folder it sits in, and the path to your home directory, stay
+local.
+
 Your usage is visible to whoever administers billing. If that matters to you,
 raise it before installing rather than after.
 
@@ -85,7 +90,7 @@ raise it before installing rather than after.
 1. copies the repo-tag hook to `~/.cyclotron/claude-repo-tag.py`
 2. **merges** the telemetry settings into your `~/.claude/settings.json`, keeping
    everything already in it — your permissions, theme, and any other hooks are
-   preserved, and a timestamped `.bak-…` backup is written first
+   preserved, and a `settings.json.bak` backup is written first
 3. checks the receiver is reachable and accepts the token, and tells you if not
 
 Re-running it is safe: it replaces its own entries instead of stacking duplicates.
@@ -111,6 +116,11 @@ Double-click **`Uninstall.command`** (macOS) or **`Uninstall.bat`** (Windows).
 
 That removes the hook file and only the settings this installer added — your own
 settings stay. Telemetry stops with your next session.
+
+It also deletes the `settings.json.bak` it took on the way in, once the cleaned
+`settings.json` is safely written. That file contains a copy of the billing
+token, so leaving it behind would mean the uninstall had not actually removed
+the credential from your machine. Your own backups are untouched.
 
 ## Keep this folder
 

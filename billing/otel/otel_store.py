@@ -58,7 +58,10 @@ CREATE TABLE IF NOT EXISTS session_repo_timeline (
   seq INTEGER,                      -- ms-within-second, orders events inside one second
   repo TEXT,                        -- normalized repo key ('unknown' if no remote)
   repo_raw TEXT,                    -- original git remote URL
-  cwd TEXT,                         -- working directory that produced it
+  cwd TEXT,                         -- LEGACY, no longer populated: a local file
+                                    -- path, which the consent notice promises
+                                    -- is not collected. Kept so pre-existing
+                                    -- rows still read back; new rows store ''.
   event TEXT,                       -- SessionStart | CwdChanged | DirectoryAdded | SessionEnd
   ingested_at TEXT,
   PRIMARY KEY (session_id, ts, seq, repo)   -- a byte-identical replay of one
@@ -178,13 +181,17 @@ class OtelStore:
         return cur.rowcount > 0
 
     # ---- session -> repo timeline (fed by the CwdChanged hook) ---------
-    def insert_session_repo(self, *, session_id, ts, seq, repo, repo_raw, cwd,
-                            event) -> bool:
+    def insert_session_repo(self, *, session_id, ts, seq, repo, repo_raw,
+                            event, cwd="") -> bool:
         """Record that `session_id` was working in `repo` as of `ts`.
 
         Returns True if inserted, False if an identical entry already existed.
         Duplicate entries for the same repo+second are harmless — the as-of
         join reads the latest one and they all name the same repo.
+
+        `cwd` is retained only so rows written before it was dropped still read
+        back; the receiver no longer passes it and new rows store ''. It is not
+        part of the primary key, so dedupe is unaffected.
         """
         cur = self.db.execute(
             """INSERT OR IGNORE INTO session_repo_timeline

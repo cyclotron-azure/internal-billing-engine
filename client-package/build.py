@@ -6,7 +6,8 @@
 
 Files land at the zip root (so a developer unzips and double-clicks
 `Install.command` / `Install.bat` from the extracted folder, with no nested
-directory).
+directory). The archive is written to `dist/` (gitignored) - see WHERE THE ZIP
+GOES below, that location is a safety property and not a preference.
 
 ONE-CLICK MODE AND WHAT IT COSTS
   With --endpoint/--token, this writes `billing-config.json` into the archive.
@@ -19,8 +20,18 @@ ONE-CLICK MODE AND WHAT IT COSTS
   share with access control) - not email, not Slack, not a public bucket. Use
   --no-config to build the older flavour where the token travels separately.
 
-  The config is generated in memory and never written into the source tree, so
-  the working copy and git history stay clean of the token.
+WHERE THE ZIP GOES, AND WHY IT MATTERS
+  The config is generated in memory and never written into the source tree as a
+  loose file. That alone does NOT keep the token out of git, because the archive
+  containing it is a file in the repo too: this used to default to
+  `<repo>/client-package.zip`, which was git-tracked, so a build followed by
+  `git commit -a` would publish a live billing token - and the
+  `billing-config.json` rule in .gitignore cannot catch it once the archive
+  itself is tracked.
+
+  So the default output is now `<repo>/dist/client-package.zip`, `dist/` is
+  gitignored, and a build that bakes in credentials refuses to write over any
+  git-tracked path.
 
 Timestamps are pinned so rebuilding identical sources produces an identical zip,
 which makes the published checksum meaningful. Note that a baked token is part
@@ -35,6 +46,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import zipfile
 
@@ -84,8 +96,11 @@ def scan_for_secrets(here: str) -> None:
             low = line.lower()
             if "sk-ant-" in low:
                 raise SystemExit("Refusing to build: %s appears to contain an API key." % name)
-            # A 64-char hex run is what `openssl rand -hex 32` produces.
-            if "token" in low and re.search(r"\b[0-9a-f]{64}\b", line):
+            # A 64-char hex run is what `openssl rand -hex 32` produces. Checked
+            # regardless of what else is on the line: requiring the word "token"
+            # nearby let a bare constant, a URL query value, or a header written
+            # some other way straight through.
+            if re.search(r"\b[0-9a-f]{64}\b", low):
                 raise SystemExit(
                     "Refusing to build: %s line looks like a real token:\n  %s"
                     % (name, line.strip()[:120]))
@@ -123,10 +138,36 @@ def add(zf: zipfile.ZipFile, name: str, data: bytes) -> None:
             data = data.replace(b"\n", b"\r\n")
 
     info = zipfile.ZipInfo(name, date_time=FIXED_DATE)
-    mode = 0o755 if name.endswith(EXECUTABLE) else 0o644
-    info.external_attr = (mode << 16) | 0o600
+    # ZipInfo defaults create_system to 0 (FAT) on Windows and 3 (Unix)
+    # elsewhere, and macOS extractors honour the mode in external_attr ONLY when
+    # it says Unix. Built on Windows and left at the default, every entry comes
+    # out non-executable, Install.command loses its +x, and a Finder
+    # double-click silently does nothing - which is the whole failure the
+    # EXECUTABLE tuple above exists to prevent. Pin it so the zip is identical
+    # whichever platform built it.
+    info.create_system = 3
+    # S_IFREG | perms. The regular-file bits are not decoration: a mode with a
+    # zero file type reads as "unknown" to some extractors, which then fall back
+    # to their own default and drop the +x again.
+    info.external_attr = (0o100755 if name.endswith(EXECUTABLE) else 0o100644) << 16
     info.compress_type = zipfile.ZIP_DEFLATED
     zf.writestr(info, data)
+
+
+def is_git_tracked(path: str, repo_hint: str) -> bool:
+    """True if git tracks `path`. No git, or no repo, counts as untracked.
+
+    Used to keep a baked archive off the tracked tree; see WHERE THE ZIP GOES.
+    Absent/broken git means we cannot prove it is tracked, and a build from an
+    unpacked source tarball with no .git must still work, so the answer is False.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo_hint, "ls-files", "--error-unmatch", path],
+            capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
 
 
 def main() -> int:
@@ -140,7 +181,7 @@ def main() -> int:
     ap.add_argument("--no-config", action="store_true",
                     help="build without credentials; installers then require flags")
     ap.add_argument("--out", default="",
-                    help="output path (default: ../client-package.zip)")
+                    help="output path (default: ../dist/client-package.zip)")
     args = ap.parse_args()
 
     if not args.no_config and not (args.endpoint and args.token):
@@ -149,7 +190,21 @@ def main() -> int:
             "--no-config to build one where the developer supplies both.")
 
     here = os.path.dirname(os.path.abspath(__file__))
-    out = args.out or os.path.join(os.path.dirname(here), "client-package.zip")
+    out = args.out or os.path.join(os.path.dirname(here), "dist", "client-package.zip")
+    out = os.path.abspath(out)
+
+    # Checked before any work: a baked archive is a credential, and writing one
+    # over a tracked file is how a live billing token reaches the remote on the
+    # next `git commit -a`. Only enforced when credentials are actually baked -
+    # a --no-config zip carries no secret and may live wherever it likes.
+    if not args.no_config and is_git_tracked(out, here):
+        raise SystemExit(
+            "Refusing to write a token-bearing archive over a git-tracked file:\n"
+            "    %s\n"
+            "The next `git commit -a` would publish the billing token, and the\n"
+            "billing-config.json rule in .gitignore cannot catch it inside a zip.\n"
+            "Untrack it (`git rm --cached <file>`) and gitignore it, or pass --out\n"
+            "with a path outside version control." % out)
 
     missing = [n for n in CONTENTS if not os.path.exists(os.path.join(here, n))]
     if missing:
@@ -161,6 +216,7 @@ def main() -> int:
     scan_for_secrets(here)
     config_body = build_config(args)
 
+    os.makedirs(os.path.dirname(out), exist_ok=True)
     if os.path.exists(out):
         os.remove(out)
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:

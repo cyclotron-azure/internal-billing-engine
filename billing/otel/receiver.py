@@ -26,6 +26,10 @@ Authentication (shared fleet token):
     warning) so the token can be rolled out to machines before enforcement is
     turned on; pass --require-auth to refuse to start without one.
 
+    --require-auth only gates STARTUP. To actually run without auth on a machine
+    whose .env sets RECEIVER_AUTH_TOKEN, pass --open, which clears it for that
+    run. The startup banner's auth= field always reports what is really enforced.
+
 Dependency-free (stdlib http.server). For production durability you'd normally
 front this with an OpenTelemetry Collector; this is the lean direct path.
 """
@@ -197,10 +201,13 @@ def ingest_session_repo_payload(payload: dict, store: OtelStore) -> dict:
     if not session_id or not ts:
         raise ValueError("session_id and ts are required")
     repo_raw = payload.get("repo_raw") or ""
+    # `cwd` is intentionally not read, even if an older hook still sends it: the
+    # developer-facing consent notice promises no file paths are collected, and
+    # a working directory is one. See the note in claude-repo-tag.py.
     inserted = store.insert_session_repo(
         session_id=session_id, ts=ts, seq=payload.get("seq") or 0,
         repo=normalize_remote(repo_raw), repo_raw=repo_raw,
-        cwd=payload.get("cwd") or "", event=payload.get("event") or "")
+        event=payload.get("event") or "")
     store.commit()
     return {"inserted": 1 if inserted else 0,
             "duplicate": 0 if inserted else 1,
@@ -281,11 +288,24 @@ class Handler(BaseHTTPRequestHandler):
         self._ok()
 
 
-def serve(host: str, port: int, db: str | None = None, require_auth: bool = False):
+def serve(host: str, port: int, db: str | None = None, require_auth: bool = False,
+          open_auth: bool = False):
+    global AUTH_TOKEN
+    if open_auth and require_auth:
+        raise SystemExit(
+            "[receiver] --open and --require-auth contradict each other — pick one.")
+    if open_auth and AUTH_TOKEN:
+        # --open has to clear the configured token, not merely skip the startup
+        # check. AUTH_TOKEN comes from RECEIVER_AUTH_TOKEN, which .env normally
+        # sets, and _authorized() treats any non-empty value as "enforce" — so
+        # without this the receiver would 401 every tokenless write while the
+        # caller had been told it was running open.
+        AUTH_TOKEN = ""
+        print("[receiver] --open: ignoring RECEIVER_AUTH_TOKEN for this run.")
     if require_auth and not AUTH_TOKEN:
         raise SystemExit(
             "[receiver] --require-auth set but RECEIVER_AUTH_TOKEN is empty — refusing "
-            "to start. Set the token, or drop --require-auth to run open.")
+            "to start. Set the token, or pass --open to run without auth.")
     Handler.store = OtelStore(db) if db else OtelStore()
     server = HTTPServer((host, port), Handler)
     auth_state = "ENABLED" if AUTH_TOKEN else "DISABLED"
@@ -309,8 +329,12 @@ def main():
     ap.add_argument("--db", default=None)
     ap.add_argument("--require-auth", action="store_true",
                     help="refuse to start unless RECEIVER_AUTH_TOKEN is set")
+    ap.add_argument("--open", dest="open_auth", action="store_true",
+                    help="accept unauthenticated writes even if RECEIVER_AUTH_TOKEN "
+                         "is set (local development only)")
     args = ap.parse_args()
-    serve(args.host, args.port, args.db, require_auth=args.require_auth)
+    serve(args.host, args.port, args.db, require_auth=args.require_auth,
+          open_auth=args.open_auth)
 
 
 if __name__ == "__main__":

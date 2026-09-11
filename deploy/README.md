@@ -1,7 +1,7 @@
 # Fleet deployment (MDM) — Claude Code usage telemetry
 
 > **Just enrolling a few volunteers?** Don't use this. Send them
-> `client-package.zip` instead — they double-click one file, no admin rights, no
+> `client-package.zip` (built into `dist/`) instead — they double-click one file, no admin rights, no
 > MDM. See [`../client-package/ADMIN.md`](../client-package/ADMIN.md). This
 > document is the *enforced* fleet-wide track.
 
@@ -273,6 +273,12 @@ for a hosted endpoint.
 `python3 -m billing.otel.receiver --host 0.0.0.0 --require-auth`, or on Windows
 `.\deploy\start-local.ps1 -BindAll` (it locates Python for you). Only bind beyond
 localhost behind a TLS proxy.
+
+To run genuinely without auth on a box whose `.env` sets `RECEIVER_AUTH_TOKEN`,
+pass `--open` (`-Open` to `start-local.ps1`), which clears the token for that run.
+Dropping `--require-auth` is **not** the same thing — that flag only decides
+whether the receiver refuses to start without a token. The startup banner's
+`auth=` field is the authority on what is actually being enforced.
 
 **Production hardening:**
 - **TLS** — dev machines should hit `https://…`, not raw `:4318`. Front the

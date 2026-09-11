@@ -8,6 +8,16 @@
 # against a hand-written copy used for local testing.
 billing-config.json
 
+# Built distributables — a one-click zip has billing-config.json INSIDE it, so
+# the archive is itself a credential. The rule above cannot see into a zip, so
+# the archive has to be ignored in its own right. build.py writes to dist/ and
+# refuses to overwrite a tracked path when it bakes credentials in.
+#
+# pilot-package.zip is deliberately NOT here: it ships placeholders only, no
+# token, and nothing regenerates it — so it stays tracked.
+dist/
+client-package.zip
+
 # Local data
 data/
 *.db

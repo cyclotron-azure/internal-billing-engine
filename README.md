@@ -143,7 +143,9 @@ Shared:
 ### `billing/otel/` — the OTEL (repo-level) path
 
 - **`receiver.py`** — minimal OTLP/JSON HTTP server. Accepts `claude_code.token.usage` and `claude_code.cost.usage` from Claude Code (handles chunked + gzip bodies), extracts repo/user/model/token-type, dedupes, writes to the store. Also accepts `POST /v1/session-repo` from the repo-tag hook. Every POST must present the shared fleet token (`X-Billing-Token` or `Authorization: Bearer`) once `RECEIVER_AUTH_TOKEN` is set; unset means open, with a loud startup warning.
-  `python -m billing.otel.receiver` (`--host`, `--port`, `--db`, `--require-auth`)
+  `python -m billing.otel.receiver` (`--host`, `--port`, `--db`, `--require-auth`,
+  `--open`). `--require-auth` gates startup only; `--open` is what actually drops
+  enforcement, by clearing the configured token for that run.
 - **`attribute.py`** — resolves *which repo a datapoint bills to*, at query time. Joins the `session_repo_timeline` onto each datapoint as-of its own timestamp, so a session that moved between repos splits across them. Falls back through `timeline → wrapper → no_remote → absent`, and exposes that choice as `attribution_source` so you can see which signal is carrying the bill. Resolution is derived, never stored: a late or corrected timeline retroactively fixes past bills with no re-ingest.
 - **`otel_store.py`** — SQLite store: deduped `token_usage` and `cost_usage` datapoints, the `session_repo_timeline`, persisted invoices + line items, the optional `repo_name_map` override table, and the `fabric_outbox` delivery queue.
 - **`normalize.py`** — collapses git remote forms (ssh vs https, `.git`, case) into one canonical repo key so a repo isn't billed twice, and derives the short repo name (`repo_name`) that is the billing identity.
@@ -187,20 +189,25 @@ Shared:
 ### `client-package/` — opt-in rollout (developers install it themselves)
 
 The distributable, double-click alternative to the MDM track — same receiver, same
-hook, no admin rights, fully reversible. Built into `client-package.zip` at the
-repo root by `build.py`, which bakes the endpoint + token into the archive so
-developers never open a terminal.
+hook, no admin rights, fully reversible. Built into `dist/client-package.zip` by
+`build.py`, which bakes the endpoint + token into the archive so developers never
+open a terminal. `dist/` is gitignored because a baked archive holds a live token;
+the build refuses to write one over a git-tracked path.
 
 - **`ADMIN.md`** — for whoever owns the rollout: how to build, how to distribute
   (the zip carries a live token, so it *is* a credential), and what's still
   unfinished.
 - **`INSTRUCTIONS.md`** — developer-facing: install, what's collected, verify, uninstall.
-- **`build.py`** — builds the zip and refuses to package a source file containing
-  an API key or 64-char hex token. Bump `VERSION` when anything here changes.
+- **`build.py`** — builds the zip, pins Unix file modes so the launchers stay
+  executable after a macOS unzip whatever platform built the archive, and refuses
+  to package a source file containing an API key or a 64-char hex run (a backstop
+  against an obvious slip, not a guarantee). Bump `VERSION` when anything here
+  changes.
 - **`configure.py`** — the actual install/uninstall/verify logic, shared by both
-  platforms; merges into an existing `~/.claude/settings.json` atomically, with a
-  timestamped backup. The launchers and shims are wrappers around this — if you
-  add a platform, write another shim rather than reimplementing the merge.
+  platforms; merges into an existing `~/.claude/settings.json` atomically, keeping
+  one rolling backup that `uninstall` then deletes (it holds a copy of the token).
+  The launchers and shims are wrappers around this — if you add a platform, write
+  another shim rather than reimplementing the merge.
 - **`Install`/`Verify`/`Uninstall` `.command` / `.bat`** — the one-click launchers
   (macOS / Windows), wrapping `install.sh` / `install.ps1`.
 
