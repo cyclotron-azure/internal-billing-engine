@@ -26,7 +26,7 @@ import argparse
 
 from .analytics_client import AnalyticsClient, AnalyticsError
 from .otel.otel_store import OtelStore
-from .store import tokens as analytics_tokens
+from .store import Store, tokens as analytics_tokens
 
 # canonical token buckets used on both sides
 CANON = ["input", "output", "cacheRead", "cacheCreation"]
@@ -60,15 +60,25 @@ def analytics_claude_code_totals(start, end) -> dict:
     return out
 
 
-def otel_totals(store: OtelStore, start, end) -> dict:
+def _normalize_emails(emails: list[str]) -> list[str]:
+    return [e.strip().lower() for e in emails]
+
+
+def otel_totals(store: OtelStore, start, end, emails: list[str] | None = None) -> dict:
     """OTEL captured tokens in [start, end), split into captured / tagged.
 
     A repo tag is sufficient to bill (usage bills to the repo), so repo-tagged
-    tokens are exactly the billable tokens."""
-    rows = store.db.execute(
-        """SELECT repo, token_type, SUM(tokens) tok FROM token_usage
-           WHERE substr(ts,1,10) >= ? AND substr(ts,1,10) < ?
-           GROUP BY repo, token_type""", (start, end)).fetchall()
+    tokens are exactly the billable tokens. `emails`, when given, scopes to those
+    (case/whitespace-insensitive) OTEL-side user_email values."""
+    sql = """SELECT repo, token_type, SUM(tokens) tok FROM token_usage
+             WHERE substr(ts,1,10) >= ? AND substr(ts,1,10) < ?"""
+    params: list = [start, end]
+    if emails:
+        norm = _normalize_emails(emails)
+        sql += f" AND LOWER(TRIM(user_email)) IN ({','.join('?' * len(norm))})"
+        params.extend(norm)
+    sql += " GROUP BY repo, token_type"
+    rows = store.db.execute(sql, params).fetchall()
     captured = {k: 0 for k in CANON}
     tagged = {k: 0 for k in CANON}
     for r in rows:
@@ -81,12 +91,63 @@ def otel_totals(store: OtelStore, start, end) -> dict:
     return {"captured": captured, "tagged": tagged}
 
 
-def run(start: str, end: str, db: str | None = None):
+def analytics_user_totals(emails: list[str], start: str, end: str,
+                           analytics_db: str | None = None):
+    """Truth side scoped to specific users. Returns None if zero rows matched
+    across all supplied emails, else (totals, matched_emails) where totals is a
+    pure CANON dict and matched_emails is the subset of the (normalized) input
+    that matched at least one row."""
+    norm = _normalize_emails(emails)
+    store = Store(analytics_db) if analytics_db else Store()
+    placeholders = ",".join("?" * len(norm))
+    rows = store.db.execute(
+        f"""SELECT email, uncached_input, cache_creation_1h, cache_creation_5m,
+                   cache_read, output
+            FROM user_cc_usage
+            WHERE day >= ? AND day < ? AND LOWER(TRIM(email)) IN ({placeholders})""",
+        [start, end, *norm]).fetchall()
+    store.close()
+    if not rows:
+        return None
+    totals = {k: 0 for k in CANON}
+    matched: set[str] = set()
+    for r in rows:
+        matched.add(r["email"].strip().lower())
+        totals["input"] += r["uncached_input"] or 0
+        totals["output"] += r["output"] or 0
+        totals["cacheRead"] += r["cache_read"] or 0
+        totals["cacheCreation"] += (r["cache_creation_1h"] or 0) + (r["cache_creation_5m"] or 0)
+    return totals, sorted(matched)
+
+
+def run(start: str, end: str, db: str | None = None,
+        emails: list[str] | None = None, analytics_db: str | None = None):
     store = OtelStore(db) if db else OtelStore()
 
+    banner = f"RECONCILIATION  period {start} -> {end}  (product=claude_code)"
+    if emails:
+        banner += f"  emails={','.join(emails)}"
     print("=" * 70)
-    print(f"RECONCILIATION  period {start} -> {end}  (product=claude_code)")
+    print(banner)
     print("=" * 70)
+
+    if emails:
+        normalized = _normalize_emails(emails)
+        result = analytics_user_totals(emails, start, end, analytics_db)
+        if result is None:
+            print(f"\n!! No analytics rows for {emails} in {start}..{end}.")
+            print(f"   Run: python -m billing.ingest --start {start} --end {end}")
+            store.close()
+            return
+        truth, matched_emails = result
+        unmatched = sorted(set(normalized) - set(matched_emails))
+        if unmatched:
+            print(f"\n!! no analytics rows matched: {', '.join(unmatched)}")
+        otel = otel_totals(store, start, end, emails=emails)
+        captured, tagged = otel["captured"], otel["tagged"]
+        _print_funnel(truth, captured, tagged, suppress_synthetic_note=True)
+        store.close()
+        return
 
     try:
         truth = analytics_claude_code_totals(start, end)
@@ -98,6 +159,11 @@ def run(start: str, end: str, db: str | None = None):
 
     otel = otel_totals(store, start, end)
     captured, tagged = otel["captured"], otel["tagged"]
+    _print_funnel(truth, captured, tagged, suppress_synthetic_note=False)
+    store.close()
+
+
+def _print_funnel(truth, captured, tagged, suppress_synthetic_note: bool):
 
     # Per-token-type: truth vs captured -----------------------------------
     print(f"\nBY TOKEN TYPE   {'analytics(truth)':>18}{'otel captured':>16}{'coverage':>11}")
@@ -121,11 +187,10 @@ def run(start: str, end: str, db: str | None = None):
           f"   gap {ftok(C - T)} received, no repo")
 
     print("\nBILLABLE COVERAGE = repo-tagged / truth = " + pct(T, A))
-    if C < A * 0.99:
+    if not suppress_synthetic_note and C < A * 0.99:
         print("\nNote: OTEL data here is SYNTHETIC (sample_payload), so low coverage")
         print("      is expected — it reflects that no real machines emit yet, not a")
         print("      bug. Against live telemetry, this % is your real attribution rate.")
-    store.close()
 
 
 def main():
@@ -133,8 +198,10 @@ def main():
     ap.add_argument("--start", required=True, help="YYYY-MM-DD")
     ap.add_argument("--end", required=True, help="YYYY-MM-DD (exclusive)")
     ap.add_argument("--db", default=None)
+    ap.add_argument("--email", action="append", default=None)
+    ap.add_argument("--analytics-db", default=None)
     args = ap.parse_args()
-    run(args.start, args.end, args.db)
+    run(args.start, args.end, args.db, args.email, args.analytics_db)
 
 
 if __name__ == "__main__":
