@@ -23,6 +23,14 @@ def load_env(path: str = ".env") -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, val = line.partition("=")
-            key, val = key.strip(), val.strip().strip('"').strip("'")
+            key, val = key.strip(), val.strip()
+            # Strip a trailing inline comment ("KEY=value   # note"), but only
+            # outside quotes -- a quoted value may legitimately contain '#'.
+            if not (val.startswith('"') or val.startswith("'")):
+                for i, ch in enumerate(val):
+                    if ch == "#" and (i == 0 or val[i - 1].isspace()):
+                        val = val[:i].rstrip()
+                        break
+            val = val.strip('"').strip("'")
             os.environ.setdefault(key, val)
     _LOADED = True
