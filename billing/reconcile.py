@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 
 from .analytics_client import AnalyticsClient, AnalyticsError
+from .otel.attribute import resolved_view
 from .otel.otel_store import OtelStore
 from .store import Store, tokens as analytics_tokens
 
@@ -68,16 +69,20 @@ def otel_totals(store: OtelStore, start, end, emails: list[str] | None = None) -
     """OTEL captured tokens in [start, end), split into captured / tagged.
 
     A repo tag is sufficient to bill (usage bills to the repo), so repo-tagged
-    tokens are exactly the billable tokens. `emails`, when given, scopes to those
-    (case/whitespace-insensitive) OTEL-side user_email values."""
-    sql = """SELECT repo, token_type, SUM(tokens) tok FROM token_usage
-             WHERE substr(ts,1,10) >= ? AND substr(ts,1,10) < ?"""
+    tokens are exactly the billable tokens. Uses `resolved_repo` (attribute.py's
+    as-of join against session_repo_timeline) rather than the raw `repo` column,
+    so this matches what bill.py actually bills -- not just the frozen launch-time
+    wrapper tag. `emails`, when given, scopes to those (case/whitespace-insensitive)
+    OTEL-side user_email values."""
+    sql = f"""SELECT resolved_repo AS repo, token_type, SUM(tokens) tok
+              FROM ({resolved_view("token_usage")})
+              WHERE substr(ts,1,10) >= ? AND substr(ts,1,10) < ?"""
     params: list = [start, end]
     if emails:
         norm = _normalize_emails(emails)
         sql += f" AND LOWER(TRIM(user_email)) IN ({','.join('?' * len(norm))})"
         params.extend(norm)
-    sql += " GROUP BY repo, token_type"
+    sql += " GROUP BY resolved_repo, token_type"
     rows = store.db.execute(sql, params).fetchall()
     captured = {k: 0 for k in CANON}
     tagged = {k: 0 for k in CANON}
