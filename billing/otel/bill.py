@@ -28,6 +28,18 @@ from .rating import RatingService
 UNATTRIBUTED = "unknown"  # sessions with no git remote -> not tied to a repo
 
 
+def _normalize_emails(emails: list[str]) -> list[str]:
+    return [e.strip().lower() for e in emails]
+
+
+def _email_filter(emails: list[str] | None) -> tuple[str, list[str]]:
+    """Returns (' WHERE ...' or '', params) for an optional user_email scope."""
+    if not emails:
+        return "", []
+    norm = _normalize_emails(emails)
+    return f" WHERE LOWER(TRIM(user_email)) IN ({','.join('?' * len(norm))})", norm
+
+
 def ftok(n) -> str:
     n = n or 0
     if n >= 1_000_000_000:
@@ -43,11 +55,13 @@ def rule(ch="-", n=68):
     print(ch * n)
 
 
-def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
+def run(db: str | None = None, markup: float = 1.50, basis: str = "actual",
+        emails: list[str] | None = None):
     store = OtelStore(db) if db else OtelStore()
     rates = RatingService(markup=markup)
     mapping = store.get_mapping()
     name_of = lambda repo: mapping.get(repo) or repo_name(repo)
+    email_where, email_params = _email_filter(emails)
 
     # Repo is RESOLVED per datapoint against the session->repo timeline, so a
     # session that moved between repos splits across them instead of billing
@@ -59,8 +73,9 @@ def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
     # together but reported/labelled separately -- see the split below.
     cost_rows = store.db.execute(
         f"WITH r AS ({resolved_view('cost_usage')}) "
-        "SELECT resolved_repo AS repo, model, cost_source, SUM(cost_usd) c FROM r "
-        "GROUP BY resolved_repo, model, cost_source").fetchall()
+        f"SELECT resolved_repo AS repo, model, cost_source, SUM(cost_usd) c FROM r"
+        f"{email_where} "
+        "GROUP BY resolved_repo, model, cost_source", email_params).fetchall()
     actual_rows = [r for r in cost_rows if r["cost_source"] == "actual"]
     desktop_rc_rows = [r for r in cost_rows if r["cost_source"] == "rate_card"]
     # have_cost = real Anthropic-reported actual cost exists, NOT merely "some
@@ -73,14 +88,16 @@ def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
     # Rate-card estimate per repo x model (from token counts).
     token_rows = store.db.execute(
         f"WITH r AS ({resolved_view('token_usage')}) "
-        "SELECT resolved_repo AS repo, model, token_type, SUM(tokens) tok FROM r "
-        "GROUP BY resolved_repo, model, token_type").fetchall()
+        f"SELECT resolved_repo AS repo, model, token_type, SUM(tokens) tok FROM r"
+        f"{email_where} "
+        "GROUP BY resolved_repo, model, token_type", email_params).fetchall()
 
     # How much of the bill each signal is carrying, and which sessions moved.
     source_rows = store.db.execute(
         f"WITH r AS ({resolved_view('token_usage')}) "
-        "SELECT attribution_source, SUM(tokens) tok FROM r "
-        "GROUP BY attribution_source ORDER BY tok DESC").fetchall()
+        f"SELECT attribution_source, SUM(tokens) tok FROM r"
+        f"{email_where} "
+        "GROUP BY attribution_source ORDER BY tok DESC", email_params).fetchall()
     multi_repo = store.multi_repo_sessions()
 
     # Double-billing guard: a session_id carrying BOTH otlp and transcript
@@ -164,7 +181,10 @@ def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
         cost_by_name_model = ratecard_by_name_model
 
     print("=" * 68)
-    print("PER-REPO BILL  (OTEL repo-attributed Claude Code usage)")
+    header = "PER-REPO BILL  (OTEL repo-attributed Claude Code usage)"
+    if emails:
+        header += f"  emails={','.join(emails)}"
+    print(header)
     if use_actual:
         if has_desktop_rc:
             # A mixed store must never be labelled simply "ACTUAL" -- part of
@@ -273,8 +293,10 @@ def main():
     ap.add_argument("--markup", type=float, default=1.50)
     ap.add_argument("--basis", choices=["actual", "rates"], default="actual",
                     help="actual = claude_code.cost.usage; rates = RatingService estimate")
+    ap.add_argument("--email", action="append", default=None,
+                    help="scope to these user_email values (repeatable)")
     args = ap.parse_args()
-    run(args.db, args.markup, args.basis)
+    run(args.db, args.markup, args.basis, args.email)
 
 
 if __name__ == "__main__":
