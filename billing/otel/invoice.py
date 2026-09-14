@@ -21,6 +21,7 @@ import os
 from collections import defaultdict
 from datetime import datetime, timezone
 
+from .attribute import resolved_view
 from .normalize import normalize_model, repo_name
 from .otel_store import OtelStore
 
@@ -56,6 +57,10 @@ def gather(store: OtelStore, start: str, end: str):
     already a pre-markup RatingService estimate, computed by
     transcript.map_record). The split is derived here, at generation time,
     from the existing `cost_source` column -- no new persisted column.
+
+    Repo is RESOLVED per row against the session->repo hook timeline (see
+    billing.otel.attribute), same as bill.py/export.py -- never the raw
+    `repo` column, which is only the wrapper's frozen launch-time tag.
     """
     mapping = store.get_mapping()
     name_of = lambda repo: mapping.get(repo) or repo_name(repo)
@@ -74,9 +79,10 @@ def gather(store: OtelStore, start: str, end: str):
     cost_actual = defaultdict(float)
     cost_estimated = defaultdict(float)
     for r in store.db.execute(
-            "SELECT repo, model, cost_source, SUM(cost_usd) c FROM cost_usage "
+            f"WITH r AS ({resolved_view('cost_usage')}) "
+            "SELECT resolved_repo AS repo, model, cost_source, SUM(cost_usd) c FROM r "
             "WHERE substr(ts,1,10) >= ? AND substr(ts,1,10) < ? "
-            "GROUP BY repo, model, cost_source", (start, end)):
+            "GROUP BY resolved_repo, model, cost_source", (start, end)):
         key = (r["repo"], normalize_model(r["model"]))
         if r["cost_source"] == "rate_card":
             cost_estimated[key] += r["c"] or 0.0
@@ -86,9 +92,10 @@ def gather(store: OtelStore, start: str, end: str):
     # tokens per repo x model
     toks = defaultdict(int)
     for r in store.db.execute(
-            "SELECT repo, model, SUM(tokens) t FROM token_usage "
+            f"WITH r AS ({resolved_view('token_usage')}) "
+            "SELECT resolved_repo AS repo, model, SUM(tokens) t FROM r "
             "WHERE substr(ts,1,10) >= ? AND substr(ts,1,10) < ? "
-            "GROUP BY repo, model", (start, end)):
+            "GROUP BY resolved_repo, model", (start, end)):
         toks[(r["repo"], normalize_model(r["model"]))] += r["t"] or 0
 
     entities = defaultdict(lambda: defaultdict(
