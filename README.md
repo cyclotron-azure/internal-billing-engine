@@ -139,7 +139,7 @@ Shared:
 - **`report.py`** — prints what the Analytics data reveals (product/model/user breakdown, cost) and where it can't attribute (no repo dimension).
 
 **Bridge:**
-- **`reconcile.py`** — compares OTEL-captured tokens against the authoritative Analytics total as a funnel (truth → captured → repo-tagged). Repo-tagged usage is billable, so that's the last stage.
+- **`reconcile.py`** — compares OTEL-captured tokens against the authoritative Analytics total as a funnel (truth → captured → repo-tagged). Repo-tagged usage is billable, so that's the last stage. Every abbreviated figure (e.g. `1.2K`) prints beside its exact integer; an `UNMAPPED TOKEN TYPES` section appears whenever a token type outside the canonical set shows up; a `DEDUPE DROPS` section reports duplicate-datapoint drops across four measurement states (never counted / began after this window / began during this window / fully counted); and `--by-surface` (breaks captured tokens down by `usage_source`/`entrypoint`/`query_source`), `--daily` (per-day rows), and `--detail` (both) flags drill in further. The `--by-surface` breakdown is a **share of captured, not coverage** — the Analytics truth side carries no `usage_source`/`entrypoint`/`query_source` dimension to compare against, so there is no truth-side denominator for those percentages.
   This is the acceptance test / coverage metric for the OTEL rollout.
   `python -m billing.reconcile --start 2026-07-14 --end 2026-07-15`
 
@@ -149,7 +149,7 @@ Shared:
   `python -m billing.otel.receiver` (`--host`, `--port`, `--db`, `--require-auth`)
 - **`transcript.py`** — the wire-payload contract for `POST /v1/transcript-usage`: a 14-field schema (fail-closed — an unknown field, including `cwd`, is a per-record rejection, never silently ignored), per-record validation, `MAX_BATCH_SIZE=500`, and the mapping from one validated record to its `token_usage` rows (terminal-block collapse already done client-side) plus a rate-card-costed `cost_usage` row. Pure and stdlib-only — no I/O, no store access.
 - **`attribute.py`** — resolves *which repo a datapoint bills to*, at query time. Joins the `session_repo_timeline` onto each datapoint as-of its own timestamp, so a session that moved between repos splits across them. Falls back through `desktop-scratch → timeline → absent → no_remote → wrapper` (checked in that order — `desktop-scratch` is deliberately first: a scratch desktop session still gets a timeline row, but one that carries no billable repo, so it must be claimed before the `timeline` branch would otherwise claim it), and exposes that choice as `attribution_source` so you can see which signal is carrying the bill. Resolution is derived, never stored: a late or corrected timeline retroactively fixes past bills with no re-ingest.
-- **`otel_store.py`** — SQLite store: deduped `token_usage` and `cost_usage` datapoints (each carrying `usage_source` — `otlp` | `transcript` — plus `token_usage.entrypoint` and `cost_usage.cost_source` — `actual` | `rate_card` — so desktop-sourced rows are distinguishable from CLI/OTLP ones), the `session_repo_timeline`, persisted invoices + line items, the optional `repo_name_map` override table, and the `fabric_outbox` delivery queue.
+- **`otel_store.py`** — SQLite store: deduped `token_usage` and `cost_usage` datapoints (each carrying `usage_source` — `otlp` | `transcript` — plus `token_usage.entrypoint` and `cost_usage.cost_source` — `actual` | `rate_card` — so desktop-sourced rows are distinguishable from CLI/OTLP ones), `dedupe_drops` (per-`(day, token_type, usage_source)` count of datapoints rejected as duplicates), the `session_repo_timeline`, persisted invoices + line items, the optional `repo_name_map` override table, and the `fabric_outbox` delivery queue. The counting-start epoch in `meta` is written by the insert path, not by migration, so a store opened only by a read-only consumer never acquires one — which is what lets `reconcile.py` distinguish "never counted" from "counted, zero duplicates".
 - **`normalize.py`** — collapses git remote forms (ssh vs https, `.git`, case) into one canonical repo key so a repo isn't billed twice, and derives the short repo name (`repo_name`) that is the billing identity.
 - **`repos.py`** — manage the OPTIONAL repo→billing-name override map: `export` observed repos to CSV, edit the `bill_name` column to rename/group a repo, then `import`. Not needed by default — every repo bills under its own name.
   `python -m billing.otel.repos export --out repo_name_map.csv`
@@ -401,10 +401,16 @@ sessions are permanently unbilled. Two viable postures:
 
 The real developer-facing cost is behavioral, not performance: sessions must
 start **inside a git repo with an `origin` remote** (else `repo=unknown`, which is
-unattributable), and the **VS Code extension does not export OTEL**, so the CLI is
-the only billable surface. Both are coverage problems wearing UX clothing.
-Re-confirm the VS Code limitation against the current Claude Code version before
-building policy on it.
+unattributable). That is a coverage problem wearing UX clothing.
+
+The **VS Code extension does export OTEL** — it drives the `claude` CLI
+underneath, so it inherits the CLI's exporter and the wrapper's `repo=` resource
+attribute, and its usage bills like any other CLI session. The one surface with
+no OTLP exporter of its own is the **desktop app**, which is why
+`claude-transcript-usage.py` exists (see `deploy/README.md` §3a). Confirm the
+extension still spawns the PATH `claude` (and therefore `claude-wrapper.sh`)
+after a Claude Code upgrade — that, not the exporter, is what repo attribution
+depends on.
 
 ### Phase 0 — Decisions and clearances (before any infra)
 
@@ -449,8 +455,13 @@ The pilot exists to produce numbers that cannot be estimated:
 
 - **Coverage** — `python -m billing.reconcile --start … --end …`. The funnel
   (truth → captured → repo-tagged) is the acceptance test. truth→captured is
-  telemetry loss (roaming, restarts, VS Code); captured→tagged is the `unknown`
-  bucket (sessions outside a git repo).
+  telemetry loss (roaming, restarts, short sessions dropped before a metric
+  export interval flushes, desktop-app sessions not yet swept); captured→tagged
+  is the `unknown`
+  bucket (sessions outside a git repo). `--daily`/`--by-surface` (or `--detail`
+  for both) break the funnel down per-day and per-surface, so a receiver
+  outage shows up as a one-day cliff instead of being averaged away across
+  the whole window.
 - **Rows per developer per day** — count `token_usage` rows ÷ active devs. This is
   the input to the capacity plan below.
 - **The `unknown` rate** — flagged by `bill.py`. High means a workflow problem to

@@ -132,7 +132,35 @@ CREATE TABLE IF NOT EXISTS fabric_outbox (
 CREATE INDEX IF NOT EXISTS ix_outbox_status ON fabric_outbox(status, next_attempt_at);
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+-- Per-(day, token_type, usage_source) count of datapoints rejected as
+-- duplicates by INSERT OR IGNORE in insert_datapoint / insert_cost_datapoint.
+-- `day` is derived from the DROPPED datapoint's own timestamp (never
+-- wall-clock now) so a replayed old export counts against the day it
+-- describes -- the same day reconcile.py queries for. Cost-row drops use the
+-- literal token_type sentinel '__cost__', matching dp_key's existing cost
+-- sentinel. See DEDUPE_EPOCH_META_KEY below for the companion counting-start
+-- epoch that says whether a window's absence of rows here is real or just
+-- never measured.
+CREATE TABLE IF NOT EXISTS dedupe_drops (
+  day TEXT NOT NULL,            -- UTC YYYY-MM-DD, from the dropped datapoint's own ts
+  token_type TEXT NOT NULL,     -- input|output|cacheRead|cacheCreation|__cost__
+  usage_source TEXT NOT NULL,   -- 'otlp' | 'transcript'
+  drops INTEGER NOT NULL DEFAULT 0,
+  first_seen TEXT,              -- UTC ISO8601 when this bucket's first drop was counted
+  last_seen TEXT,                -- UTC ISO8601 when its most recent drop was counted
+  PRIMARY KEY (day, token_type, usage_source)
+);
 """
+
+# meta key holding the UTC ISO8601 timestamp of the first insert ATTEMPT ever
+# made against this database by counter-aware (task-01+) code -- see the
+# "Counting-start epoch" rationale in insert_datapoint/insert_cost_datapoint
+# for why this is written from the insert path, never from _migrate(), and
+# why the in-memory latch guarding it closes on a SELECT-confirmed read, not
+# on the write attempt itself. Task 02 imports this constant rather than
+# hardcoding the string.
+DEDUPE_EPOCH_META_KEY = "dedupe_counting_since"
 
 
 def _now() -> str:
@@ -229,6 +257,24 @@ def _migrate(db) -> None:
     if "cost_source" not in cost_cols:
         db.execute(
             "ALTER TABLE cost_usage ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'actual'")
+
+    # Belt-and-braces: SCHEMA's CREATE TABLE IF NOT EXISTS already creates
+    # dedupe_drops on both fresh and existing databases (executescript(SCHEMA)
+    # runs before _migrate() in __init__), so this is a no-op in practice.
+    # Kept anyway for consistency with how the columns above are handled.
+    # Deliberately does NOT write DEDUPE_EPOCH_META_KEY -- see the
+    # "Counting-start epoch" rationale on insert_datapoint /
+    # insert_cost_datapoint for why that must come from the insert path only.
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS dedupe_drops (
+          day TEXT NOT NULL,
+          token_type TEXT NOT NULL,
+          usage_source TEXT NOT NULL,
+          drops INTEGER NOT NULL DEFAULT 0,
+          first_seen TEXT,
+          last_seen TEXT,
+          PRIMARY KEY (day, token_type, usage_source)
+        )""")
     db.commit()
 
 
@@ -239,6 +285,87 @@ class OtelStore:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         _migrate(self.db)
+        # In-memory latch for the counting-start epoch (DEDUPE_EPOCH_META_KEY).
+        # Deliberately per-INSTANCE, not persisted, and set ONLY when a SELECT
+        # has confirmed the key is present in the database -- never merely
+        # because this instance issued the INSERT. See
+        # _ensure_dedupe_epoch's docstring for the full rationale (a defect
+        # found in Phase 3 cycle 2: latching on the write attempt instead of
+        # on confirmation would permanently strand dedupe_epoch() at None if
+        # the first request of the process happened to roll back).
+        self._dedupe_epoch_confirmed = False
+
+    def _ensure_dedupe_epoch(self) -> None:
+        """Write DEDUPE_EPOCH_META_KEY at most once, ever, called on every
+        insert_datapoint / insert_cost_datapoint ATTEMPT (inserted or
+        duplicate alike) so the epoch means "counter-aware code has run at
+        least once" -- not "a collision has happened".
+
+        Latches on CONFIRMATION, not on attempt: self._dedupe_epoch_confirmed
+        is set ONLY by a SELECT that found the key already committed, never
+        by this instance's own INSERT. Concretely: if the flag is unset,
+        SELECT the key; if present, latch and do nothing else; if absent,
+        write it and leave the flag UNSET so the next insert attempt
+        re-checks.
+
+        Why (Phase 3 cycle 2 defect): this write deliberately does not
+        commit() -- it rides the caller's transaction, which receiver.py
+        commits per request. If the first request of the process is rolled
+        back (store.db.rollback(), an ordinary path for
+        sqlite3.OperationalError on a single-host deployment), a
+        latch-on-attempt flag would discard that write and never retry it for
+        the process lifetime -- dedupe_epoch() would return None forever
+        even as later successful requests commit real drops. Latching only
+        on confirmation costs one primary-key SELECT per insert until the
+        epoch is actually committed, and exactly zero thereafter.
+
+        Never raises: a failure to record the epoch must not turn into a
+        billing-ingest failure.
+        """
+        if self._dedupe_epoch_confirmed:
+            return
+        try:
+            row = self.db.execute(
+                "SELECT 1 FROM meta WHERE key=?", (DEDUPE_EPOCH_META_KEY,)).fetchone()
+            if row is not None:
+                self._dedupe_epoch_confirmed = True
+            else:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+                    (DEDUPE_EPOCH_META_KEY, _now()))
+                # Flag stays unset -- this instance issued the write but has
+                # not yet seen it confirmed; the next attempt re-checks.
+        except sqlite3.Error:
+            pass
+
+    def _record_dedupe_drop(self, *, day: str, token_type: str, usage_source: str) -> None:
+        """Increment the dedupe_drops bucket for one collided insert attempt.
+
+        Called ONLY from the `cur.rowcount == 0` (duplicate) branch of
+        insert_datapoint / insert_cost_datapoint -- never on a successful
+        insert. Uses the portable INSERT OR IGNORE + UPDATE pair (not
+        `ON CONFLICT ... DO UPDATE`, which needs SQLite 3.24+ that this repo
+        does not pin) so both statements are primary-key-targeted against a
+        table holding at most a few rows per day -- bounded even though a
+        retried OTLP export re-sends a whole batch and collides all at once.
+
+        Never raises: losing a diagnostic count is acceptable, breaking
+        billing ingest is not. Does not commit() -- rides the caller's
+        transaction like everything else on this path.
+        """
+        try:
+            now = _now()
+            self.db.execute(
+                """INSERT OR IGNORE INTO dedupe_drops
+                   (day, token_type, usage_source, drops, first_seen, last_seen)
+                   VALUES (?, ?, ?, 0, ?, ?)""",
+                (day, token_type, usage_source, now, now))
+            self.db.execute(
+                """UPDATE dedupe_drops SET drops = drops + 1, last_seen = ?
+                   WHERE day=? AND token_type=? AND usage_source=?""",
+                (now, day, token_type, usage_source))
+        except sqlite3.Error:
+            pass
 
     def insert_datapoint(self, *, session_id, repo, repo_raw, user_email, user_id,
                          org_id, model, token_type, query_source, tokens,
@@ -307,6 +434,11 @@ class OtelStore:
             (key, _ns_to_iso(time_unix_nano), session_id, repo, repo_raw,
              user_email, user_id, org_id, model, token_type, query_source,
              int(tokens or 0), _now(), usage_source, entrypoint))
+        self._ensure_dedupe_epoch()
+        if cur.rowcount == 0:
+            self._record_dedupe_drop(
+                day=_ns_to_iso(time_unix_nano)[:10], token_type=token_type,
+                usage_source=usage_source)
         return cur.rowcount > 0
 
     def insert_cost_datapoint(self, *, session_id, repo, repo_raw, user_email,
@@ -361,7 +493,47 @@ class OtelStore:
             (key, _ns_to_iso(time_unix_nano), session_id, repo, repo_raw,
              user_email, user_id, org_id, model, query_source,
              float(cost_usd or 0), _now(), usage_source, cost_source))
+        self._ensure_dedupe_epoch()
+        if cur.rowcount == 0:
+            self._record_dedupe_drop(
+                day=_ns_to_iso(time_unix_nano)[:10], token_type="__cost__",
+                usage_source=usage_source)
         return cur.rowcount > 0
+
+    # ---- dedupe-drop diagnostics (frozen read interface for task 02) ----
+    def dedupe_drops(self, start: str, end: str) -> dict:
+        """Total drops per token_type for day >= start AND day < end
+        (half-open, same convention as reconcile.otel_totals), summed across
+        usage_source. Token types with zero drops are ABSENT from the dict,
+        never present with 0."""
+        rows = self.db.execute(
+            """SELECT token_type, SUM(drops) AS drops FROM dedupe_drops
+               WHERE day >= ? AND day < ?
+               GROUP BY token_type""", (start, end)).fetchall()
+        return {r["token_type"]: r["drops"] for r in rows if r["drops"]}
+
+    def dedupe_drops_by_day(self, start: str, end: str) -> dict:
+        """{day: {token_type: drops}} over the same half-open window as
+        dedupe_drops. Days with no drops are absent."""
+        rows = self.db.execute(
+            """SELECT day, token_type, SUM(drops) AS drops FROM dedupe_drops
+               WHERE day >= ? AND day < ?
+               GROUP BY day, token_type""", (start, end)).fetchall()
+        out: dict = {}
+        for r in rows:
+            if not r["drops"]:
+                continue
+            out.setdefault(r["day"], {})[r["token_type"]] = r["drops"]
+        return out
+
+    def dedupe_epoch(self):
+        """The UTC ISO8601 counting-start timestamp, or None if no insert has
+        ever been attempted against this database by counter-aware code.
+        A plain read -- does not touch or depend on the in-memory latch used
+        by _ensure_dedupe_epoch on the insert path."""
+        row = self.db.execute(
+            "SELECT value FROM meta WHERE key=?", (DEDUPE_EPOCH_META_KEY,)).fetchone()
+        return row["value"] if row else None
 
     # ---- session -> repo timeline (fed by the CwdChanged hook) ---------
     def insert_session_repo(self, *, session_id, ts, seq, repo, repo_raw, cwd,

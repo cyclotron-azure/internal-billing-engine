@@ -1,12 +1,20 @@
+# Coverage maps
+
+This file indexes one section per goal, mapping every acceptance criterion in that
+goal's task files to the pytest node id(s) that verify it. A criterion with no test is
+listed as a **GAP**, not omitted. A reviewer can check any section against the suite
+without rerunning anything, and spot-check any node id with `python -m pytest <node id>
+-v`.
+
+Legend: `file::test_name` is a pytest node id relative to `tests/`.
+
+---
+
 # Coverage map: `desktop-usage-capture`
 
 Maps every acceptance criterion in `_goals/desktop-usage-capture/00-test-scaffold.md`
-through `07-integration.md` to the test node id that verifies it. A criterion with no
-test is listed as a **GAP**, not omitted. Committed as of task 07 (the closer); a
-reviewer can check this against the suite without rerunning anything, and spot-check
-any node id with `python -m pytest <node id> -v`.
-
-Legend: `file::test_name` is a pytest node id relative to `tests/`.
+through `07-integration.md` to the test node id that verifies it. Committed as of task
+07 (the closer).
 
 ---
 
@@ -150,3 +158,103 @@ Legend: `file::test_name` is a pytest node id relative to `tests/`.
 
 1. **Task 00 AC1** (bare collection with zero tests) has no single dedicated node id — it is a property of the whole suite at scaffold time, not something task 07 can re-verify in isolation (the scaffold now has hundreds of tests). Not a functional gap; recorded for completeness.
 2. **Task 00 AC5** (golden baseline capture is byte-identical across two captures) has no automated pytest node. It was verified once, manually, at task-00 time (per `tests/golden/README.md`'s own account of the capture procedure) and is not re-provable after the fact without re-running the original capture script against pre-task-01 code, which no longer exists in the working tree. A regression here would only be visible indirectly, via `test_bill.py::test_otlp_only_matches_golden_baseline` failing if `bill.py`'s OTLP-only output ever became non-deterministic.
+
+---
+
+# Coverage map: `reconcile-coverage-diagnostics`
+
+Maps every acceptance criterion in `_goals/reconcile-coverage-diagnostics/01-store-dedupe-counter.md`
+through `03-reconcile-output.md` to the test node id(s) that verify it. Tasks 01-03 landed
+and passed evaluation before this task (04) existed, so every row below is regression
+coverage written after the fact, against the shipped interface -- not TDD alongside the
+implementation. Criterion 01.15 (`pytest tests/test_otel_store.py -q` exits 0) is a
+command-output criterion, not a unit test, and is intentionally not represented as a row.
+
+## Task 01 — `01-store-dedupe-counter.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. `dedupe_drops` schema: 6 columns, 3-col PK | `test_dedupe_counter.py::test_ac1_dedupe_drops_schema` |
+| 2. Duplicate OTLP insert True/False, day from datapoint ts | `test_dedupe_counter.py::test_ac2_duplicate_insert_true_then_false_day_from_datapoint_ts` |
+| 3. Third duplicate raises drops to 2, advances last_seen, keeps first_seen | `test_dedupe_counter.py::test_ac3_third_duplicate_advances_last_seen_not_first_seen` |
+| 4. Successful insert adds no dedupe_drops row | `test_dedupe_counter.py::test_ac4_successful_insert_adds_no_dedupe_drops_row` |
+| 5. Duplicate transcript / cost drops counted correctly | `test_dedupe_counter.py::test_ac5_transcript_and_cost_duplicates_counted_correctly` |
+| 6. Legacy migration adds `dedupe_drops`, preserves rows, idempotent | `test_dedupe_counter.py::test_ac6_legacy_migration_adds_dedupe_drops_preserves_rows` |
+| 7. Never-inserted store has `dedupe_epoch() is None` | `test_dedupe_counter.py::test_ac7_never_inserted_store_has_no_epoch` |
+| 8. Epoch set on first insert, unchanged across reopen | `test_dedupe_counter.py::test_ac8_epoch_set_on_first_insert_unchanged_across_reopen` |
+| 9. Epoch set by successful first insert / duplicate-only first insert | `test_dedupe_counter.py::test_ac9_epoch_set_by_successful_first_insert`, `test_dedupe_counter.py::test_ac9_epoch_set_by_duplicate_only_first_insert` |
+| 10. Latch closes after exactly one post-commit meta SELECT | `test_dedupe_counter.py::test_ac10_latch_closes_after_exactly_one_meta_select_post_commit` |
+| 11. Rolled-back first epoch write recovered on next insert | `test_dedupe_counter.py::test_ac11_rollback_of_first_epoch_write_is_recovered` |
+| 12. Half-open window for `dedupe_drops`/`dedupe_drops_by_day` | `test_dedupe_counter.py::test_ac12_half_open_window_for_dedupe_reads` |
+| 13. Counter UPDATE failure: no raise, no residue via public readers | `test_dedupe_counter.py::test_ac13_counter_update_failure_does_not_raise_or_break_insert` |
+| 14. Epoch write failure: no raise, correct return value | `test_dedupe_counter.py::test_ac14_epoch_write_failure_does_not_raise_or_break_insert` |
+| 15. `pytest tests/test_otel_store.py -q` exits 0 | Command-output criterion, not a unit test (see note above). |
+
+## Task 02 — `02-reconcile-aggregation.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. Pre-change baseline pin (`otel_totals` captured/tagged) | `test_reconcile.py::test_02_1_baseline_captured_and_tagged_pinned` |
+| 2. Unmapped token type reported with correct total | `test_reconcile.py::test_02_2_unmapped_token_type_reported_with_correct_total` |
+| 3. NULL `token_type` reported under `"(none)"` | `test_reconcile.py::test_02_3_null_token_type_reported_as_none` |
+| 4. `otel_by_surface` dimensions sum to `captured_total` | `test_reconcile.py::test_02_4_by_surface_dimensions_sum_to_captured_total` |
+| 5. NULL `entrypoint`/`query_source` coalesce to `"(none)"` | `test_reconcile.py::test_02_5_null_entrypoint_and_null_query_source_coalesce_to_none` |
+| 6. Sigma-daily == period, captured + tagged | `test_reconcile.py::test_02_6_daily_sums_equal_period_totals_captured_and_tagged` |
+| 7. Sigma-daily == period, truth side (org-wide + user-scoped) | `test_reconcile.py::test_02_7_daily_sums_equal_totals_org_wide`, `test_reconcile.py::test_02_7_daily_sums_equal_totals_user_scoped` |
+| 8. Day-key literal normalized, matches `otel_daily`'s key | `test_reconcile.py::test_02_8_day_key_normalized_and_matches_otel_daily` |
+| 9. Org-wide path makes exactly one `usage_report` call | `test_reconcile.py::test_02_9_single_pass_call_count_is_exactly_one` |
+| 10. `analytics_claude_code_totals` sums the single pass correctly | `test_reconcile.py::test_02_10_totals_wrapper_sums_daily_for_fixed_fake_payload` |
+| 11. `AnalyticsError` from `usage_report` -> existing message | `test_reconcile.py::test_02_11_analytics_error_from_usage_report_produces_existing_message` |
+| 12. `analytics_claude_code_daily` returns a materialized dict eagerly | `test_reconcile.py::test_02_12_daily_returns_materialized_dict_eagerly` |
+| 13. 5 epoch placements -> `measurement` | `test_reconcile.py::test_02_13_measurement_states_for_five_epoch_placements` (parametrized, 5 cases) |
+| 14. `otel_daily`'s tagged reflects the resolved (not raw) repo | `test_reconcile.py::test_02_14_daily_tagged_reflects_resolved_repo` |
+| 15. No aggregation function prints anything | `test_reconcile.py::test_02_15_aggregation_functions_print_nothing` |
+| 16. `counts_outside_measurement`: both routes True, `full` False | `test_reconcile.py::test_02_16_counts_outside_measurement_true_replayed_export_route`, `test_reconcile.py::test_02_16_counts_outside_measurement_true_interrupted_write_route`, `test_reconcile.py::test_02_16_counts_outside_measurement_false_when_fully_counted` |
+
+## Task 03 — `03-reconcile-output.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. Default `run()` prints only the 3 base sections | `test_reconcile.py::test_03_1_default_run_prints_only_base_sections` |
+| 2. `BY TOKEN TYPE` rows + `TOTAL` pinned exactly (whitespace included) | `test_reconcile.py::test_03_2_by_token_type_rows_and_total_pinned_exactly` |
+| 3. Unmapped section prints type + exact count, default invocation | `test_reconcile.py::test_03_3_unmapped_section_prints_type_and_count` |
+| 4. No unmapped types -> no section | `test_reconcile.py::test_03_4_no_unmapped_section_when_empty` |
+| 5. Four qualifiers distinct wording; no bare count when `by_type` empty | `test_reconcile.py::test_03_5_four_qualifiers_wording_and_no_bare_count_when_empty`, `test_reconcile.py::test_03_5_all_four_states_pairwise_different` |
+| 6. `partial` state names epoch, says lower bound (with drops) / says the window's undropped portion was never counted (empty `by_type`) | `test_reconcile.py::test_03_6_partial_state_with_drops_names_epoch_and_says_lower_bound`, `test_reconcile.py::test_03_6_partial_state_with_empty_by_type_names_epoch_no_lower_bound` |
+| 7. `full` state: zero drops says "no duplicates"; nonzero prints counts | `test_reconcile.py::test_03_7_full_state_zero_drops_says_no_duplicates`, `test_reconcile.py::test_03_7_full_state_nonzero_drops_prints_exact_count` |
+| 7b. Non-empty `by_type` printed under states 1, 2, 3 with qualifier | `test_reconcile.py::test_03_7b_nonempty_by_type_printed_under_states_1_2_3` (parametrized, 3 cases) |
+| 7c. `counts_outside_measurement` names both count and epoch | `test_reconcile.py::test_03_7c_counts_outside_measurement_names_count_and_epoch` |
+| 8. `--daily` prints a truth-only day with a coverage pct | `test_reconcile.py::test_03_8_daily_prints_truth_only_day_with_coverage_pct` |
+| 9. `--daily` rows sum to the period `TOTAL` | `test_reconcile.py::test_03_9_daily_rows_sum_to_period_total` |
+| 10. `--daily` works in `--email` mode, renders tagged/billable | `test_reconcile.py::test_03_10_daily_in_email_mode_renders_tagged_and_billable` |
+| 11. Per-day dedupe sub-table renders under every measurement state | `test_reconcile.py::test_03_11_per_day_dedupe_subtable_renders_in_state_full`, `test_reconcile.py::test_03_11_per_day_dedupe_subtable_renders_in_state_none_with_epoch` |
+| 12. `--by-surface` header + 3 dimensions + `(none)` entrypoint row | `test_reconcile.py::test_03_12_by_surface_header_and_dimensions_and_none_entrypoint` |
+| 13. Each `--by-surface` sub-block `TOTAL` reads exactly `100.00%` | `test_reconcile.py::test_03_13_by_surface_total_rows_read_100_percent` |
+| 14. `--detail` contains both daily and surface section headers | `test_reconcile.py::test_03_14_detail_contains_daily_and_surface_headers`, `test_reconcile.py::test_main_detail_implies_by_surface_and_daily` |
+| 15. No-analytics-rows path and `AnalyticsError` path unchanged, no funnel | `test_reconcile.py::test_03_15_no_analytics_rows_path_prints_hint_and_no_funnel`, `test_reconcile.py::test_03_15_analytics_error_path_prints_existing_message_and_no_funnel` |
+| 16. Rule lines equal length; no output line exceeds it | `test_reconcile.py::test_03_16_rule_lines_equal_length_and_no_line_exceeds_them` |
+
+## Regression coverage (untested `--email` / org-wide `run()` paths)
+
+| Behavior | Test node id(s) |
+|---|---|
+| `analytics_user_totals` returns `None` for zero matching rows | `test_reconcile.py::test_regression_user_totals_none_when_zero_rows` |
+| `analytics_user_totals` shape (`CANON` mapping) and email/date scoping | `test_reconcile.py::test_regression_user_totals_shape_and_scoping` |
+| Email matching is case/whitespace-insensitive | `test_reconcile.py::test_regression_email_matching_case_and_whitespace_insensitive` |
+| `otel_totals(..., emails=[...])` scopes captured/tagged | `test_reconcile.py::test_regression_otel_totals_scopes_by_email` |
+| `--email` path, empty analytics: hint printed, no funnel | `test_reconcile.py::test_regression_email_path_empty_analytics_prints_hint_no_funnel` |
+| `--email` path, zero OTEL rows: normal zeroed funnel, no `SYNTHETIC` note | `test_reconcile.py::test_regression_email_path_zero_otel_rows_prints_normal_funnel_no_synthetic` |
+
+## GAPs (explicit)
+
+None. Every requirement item and acceptance criterion in `04-tests.md` that calls for a
+unit test has one; criterion 01.15 is a command-output criterion by design (see note
+above), and criterion 15 of task 01 is the only such item in this goal.
+
+Two deliberate, spec-mandated non-pins are **not** GAPs (they are wording-independent
+properties instead of verbatim string pins, per an explicit orchestrator deviation
+since Phase 5 changes both): the exact wording of the `partial`-with-empty-`by_type`
+sentence, and the `__cost__` row's column offsets. Both are still covered --
+`test_03_5_four_qualifiers_wording_and_no_bare_count_when_empty` asserts the qualifier
+text and the absence of a bare count without pinning full-sentence punctuation beyond
+that, and no test in this file asserts a byte-offset for the `__cost__` label.

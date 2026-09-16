@@ -106,8 +106,11 @@ git remote (`OTEL_RESOURCE_ATTRIBUTES=repo=<remote>`). The receiver normalizes
 that remote and maps it to a client. Sessions started outside a git repo tag as
 `repo=unknown` and surface in the `unknown` bucket (flagged, never silently mis-billed).
 
-> The VS Code extension does **not** export OTEL telemetry, so repo-attributed
-> billing standardizes on CLI usage. Direct developers to use the `claude` CLI.
+> The VS Code extension **does** export OTEL: it runs the `claude` CLI
+> underneath, so it picks up this wrapper (as long as the wrapper is the `claude`
+> on the PATH the extension resolves) and bills exactly like a terminal session.
+> No separate handling is needed. The desktop app is the surface without an
+> exporter — see §3a.
 
 ### Install (recommended, deterministic)
 Avoids PATH-ordering fragility and the wrapper-calls-itself trap:

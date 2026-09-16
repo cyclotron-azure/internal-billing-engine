@@ -109,8 +109,9 @@ Two things determine whether your usage can be attributed:
 
 - **Start sessions inside a git repo that has an `origin` remote.** Without one,
   usage is recorded as `unknown` and cannot be attributed to any project.
-- **Use the `claude` CLI.** The VS Code extension does not export telemetry, so
-  work done there is not captured.
+- **The CLI and the VS Code extension are both captured.** The extension runs
+  the `claude` CLI underneath, so it reports usage the same way a terminal
+  session does — you do not need to change how you work.
 
 To re-check your setup at any time, double-click **`Verify.command`** (macOS) or
 **`Verify.bat`** (Windows). It changes nothing and takes a second — worth running
