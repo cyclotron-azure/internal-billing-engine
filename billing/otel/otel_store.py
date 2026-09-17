@@ -162,6 +162,25 @@ CREATE TABLE IF NOT EXISTS dedupe_drops (
 # hardcoding the string.
 DEDUPE_EPOCH_META_KEY = "dedupe_counting_since"
 
+# Chunk size for sessions_with_otlp_rows' per-statement `VALUES` CTE.
+#
+# Invariant that must stay true (task 02, contract task -- do not change one
+# side without the other): ids_per_chunk x arms_binding_them + literal_binds
+# <= 999, where 999 is SQLITE_MAX_VARIABLE_NUMBER's default ceiling on
+# older/unpinned sqlite3 builds. This repo's dev machine may report a much
+# higher limit (observed: 32766), which makes a violation of this invariant
+# INVISIBLE here and reproducible only on the unpinned production host.
+#
+# The chosen shape binds the id chunk exactly ONCE via a `VALUES` CTE that
+# both table arms reference through `IN (SELECT x FROM ids)`, plus one
+# `usage_source` parameter per arm (2 arms): 500 x 1 + 2 = 502 <= 999.
+#
+# If this is ever reverted to two separate `IN (...)` lists (one per arm,
+# each repeating the full id list -- i.e. arms_binding_them=2 for the ids
+# themselves), the chunk size must drop to 498 (498 x 2 + 2 = 998; 499 does
+# not fit: 499 x 2 + 2 = 1000 > 999). 500 only fits the single-bind CTE form.
+OTLP_MEMBERSHIP_CHUNK_SIZE = 500
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -534,6 +553,150 @@ class OtelStore:
         row = self.db.execute(
             "SELECT value FROM meta WHERE key=?", (DEDUPE_EPOCH_META_KEY,)).fetchone()
         return row["value"] if row else None
+
+    # ---- ingest-freshness + OTLP-membership reads (task 02, frozen contract
+    # for tasks 03's health route / ingest guard) ------------------------
+    def last_ingest_at(self, usage_source: str | None = None) -> str | None:
+        """Greatest `ingested_at` -- the UTC ISO8601 time THIS RECEIVER STORED
+        the row -- across BOTH token_usage and cost_usage. Deliberately reads
+        `ingested_at`, never `ts` (the time the data point was RECORDED
+        upstream): a replayed export carries old `ts` values but proves the
+        receiver is alive right now via a fresh `ingested_at`. Reading `ts`
+        instead would report a live receiver as stale the moment anyone
+        replays a backlog.
+
+        Spans both tables for the same reason `sessions_with_otlp_rows` does:
+        the receiver's token and cost branches are independent
+        (receiver.py:163 for claude_code.token.usage, :176 for
+        claude_code.cost.usage), so a single payload can carry cost
+        datapoints and no token datapoints (or vice versa). A reader scoped to
+        only one table would report a live receiver as stale whenever the
+        freshest traffic happened to land in the other one.
+
+        usage_source=None (default) considers every row in both tables. A
+        non-None value filters to that usage_source EXACTLY -- no LIKE, no
+        case folding, no normalization -- so pass the stored value verbatim
+        (e.g. "otlp").
+
+        Returns None -- never "", 0, or a sentinel date -- when no row
+        matches, so callers can distinguish an empty database from a stalled
+        receiver.
+
+        Read-only (no INSERT/UPDATE/DELETE/CREATE, no commit()) and uses the
+        existing self.db connection; no new connection, no WAL pragma, no
+        pool.
+        """
+        if usage_source is None:
+            row = self.db.execute(
+                """SELECT MAX(m) AS m FROM (
+                       SELECT MAX(ingested_at) AS m FROM token_usage
+                       UNION ALL
+                       SELECT MAX(ingested_at) AS m FROM cost_usage
+                   )""").fetchone()
+        else:
+            row = self.db.execute(
+                """SELECT MAX(m) AS m FROM (
+                       SELECT MAX(ingested_at) AS m FROM token_usage
+                       WHERE usage_source = ?
+                       UNION ALL
+                       SELECT MAX(ingested_at) AS m FROM cost_usage
+                       WHERE usage_source = ?
+                   )""", (usage_source, usage_source)).fetchone()
+        return row["m"] if row and row["m"] is not None else None
+
+    def sessions_with_otlp_rows(self, session_ids) -> set:
+        """Subset of `session_ids` that has at least one usage_source='otlp'
+        row in token_usage OR cost_usage.
+
+        BOTH TABLES -- this is the safety-critical part of the contract, not
+        an implementation detail. A transcript record inserts a cost row
+        alongside its token rows, and invoice.py sums
+        `actual_cost + estimated_cost` into total_billed, so the cost side is
+        billed. Because the receiver's token and cost branches are
+        independent (receiver.py:163 / :176), a partial flush can leave a
+        session with OTLP rows in cost_usage and NONE in token_usage. A
+        token_usage-only guard would pass that session, let its transcript be
+        accepted, and land a cost_source='rate_card' row beside the existing
+        cost_source='actual' row -- billing the client twice.
+        `transcript_key` cannot catch this after the fact: it and `dp_key`
+        are deliberately designed to never collide.
+
+        Filters on usage_source='otlp' ONLY -- never additionally on
+        `entrypoint`. OTLP rows carry a NULL entrypoint (per the token_usage
+        schema comment, that column is transcript-rows-only), so adding an
+        entrypoint predicate would match zero OTLP rows and turn this guard
+        into a permanent no-op that waves every session through.
+
+        Empty/falsy `session_ids` (None, [], "", or an iterable that yields
+        nothing) returns set() WITHOUT issuing any query. This is deliberate,
+        not an optimization: a bare `IN ()` is a syntax error in SQLite, and
+        a query built to produce `IN (NULL)` instead would silently match no
+        rows and be read by the caller as "no OTLP rows exist yet -- safe to
+        insert" -- which is exactly the double-billing direction this method
+        exists to prevent.
+
+        Chunking and binding: the deduplicated id list is split into chunks
+        of OTLP_MEMBERSHIP_CHUNK_SIZE (500) ids, one statement per chunk,
+        results unioned across chunks. Each chunk is bound to a `VALUES` CTE
+        EXACTLY ONCE; both table arms reference that CTE via
+        `IN (SELECT x FROM ids)` rather than each arm carrying its own
+        repeated `IN (...)` list. Two arms each repeating the full `IN` list
+        would bind every id TWICE -- for a 500-id chunk, 500 x 2 arms + 2
+        usage_source binds = 1002 parameters, which exceeds the 999
+        SQLITE_MAX_VARIABLE_NUMBER cap on older/unpinned sqlite3 builds and
+        raises `OperationalError: too many SQL variables`. This machine's
+        cap may be far higher (e.g. 32766), which makes that regression
+        invisible in development and reproducible only in production -- see
+        OTLP_MEMBERSHIP_CHUNK_SIZE's module-level comment for the exact
+        invariant (ids_per_chunk x arms_binding_them + literal_binds <= 999)
+        this chunk size and statement shape must jointly satisfy. Chunking
+        itself is exercised even though production hands this method at most
+        one chunk's worth of ids at a time (MAX_BATCH_SIZE caps a POST at
+        500 records) -- the method's public contract accepts an unbounded
+        iterable, so the multi-chunk path must be correct regardless.
+
+        The input is deduplicated before chunking, so N copies of one id
+        issue one statement, not N/chunk_size.
+
+        Every id is bound as a `?` parameter -- never string-interpolated --
+        because session ids arrive from a client-posted payload.
+
+        Does not swallow sqlite3.Error. Unlike the dedupe_drops diagnostic
+        counter (where a failed count must never become a billing
+        rejection), a failed membership test here must propagate: the
+        caller's only safe fallback on an unanswered "does this session
+        already have OTLP rows" question is to refuse the insert, and
+        silently returning an empty set would look identical to "verified,
+        no OTLP rows" -- again, the double-billing direction.
+
+        Read-only (no INSERT/UPDATE/DELETE/CREATE, no commit()), uses the
+        existing self.db connection, and never caches or memoizes: this
+        guard is consulted during ingest, and a stale "no OTLP rows" answer
+        double-bills just as surely as a wrong one.
+        """
+        if not session_ids:
+            return set()
+        ids = list(dict.fromkeys(session_ids))
+        if not ids:
+            return set()
+
+        found: set = set()
+        chunk_size = OTLP_MEMBERSHIP_CHUNK_SIZE
+        for start in range(0, len(ids), chunk_size):
+            chunk = ids[start:start + chunk_size]
+            values_sql = ",".join("(?)" for _ in chunk)
+            sql = (
+                f"WITH ids(x) AS (VALUES {values_sql}) "
+                "SELECT session_id FROM token_usage "
+                "WHERE usage_source = ? AND session_id IN (SELECT x FROM ids) "
+                "UNION "
+                "SELECT session_id FROM cost_usage "
+                "WHERE usage_source = ? AND session_id IN (SELECT x FROM ids)"
+            )
+            params = list(chunk) + ["otlp", "otlp"]
+            rows = self.db.execute(sql, params).fetchall()
+            found.update(r["session_id"] for r in rows)
+        return found
 
     # ---- session -> repo timeline (fed by the CwdChanged hook) ---------
     def insert_session_repo(self, *, session_id, ts, seq, repo, repo_raw, cwd,

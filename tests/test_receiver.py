@@ -272,12 +272,25 @@ def test_replay_of_identical_batch_inserts_nothing_new(store, no_auth):
 
 
 # ---------------------------------------------------------------------------
-# AC 5: non-desktop entrypoint is rejected, never inserted.
+# AC 5: cli/claude-vscode are now accepted backfill entrypoints (task 03,
+# otel-export-loss-reduction) -- inverted from the original "rejected"
+# expectation. The old expectation is kept alive against a genuinely
+# out-of-set entrypoint (claude-web) just below.
 # ---------------------------------------------------------------------------
 
-def test_non_desktop_entrypoint_is_rejected(store, no_auth):
+def test_backfill_entrypoint_is_accepted_when_old_enough_and_no_otlp_row(store, no_auth):
+    rec = _record(entrypoint="cli", ts="2026-01-01T00:00:00Z")  # far older than 900s
+    status, body = _post("/v1/transcript-usage", json.dumps([rec]).encode())
+    assert status == 200
+    assert body["rejected"] == 0
+    assert body["inserted"] == 5
+    tok_rows = _token_rows(store)
+    assert len(tok_rows) == 4
+
+
+def test_out_of_set_entrypoint_still_rejected_with_invalid_entrypoint(store, no_auth):
     status, body = _post("/v1/transcript-usage",
-                          json.dumps([_record(entrypoint="cli")]).encode())
+                          json.dumps([_record(entrypoint="claude-web")]).encode())
     assert status == 200
     assert body["rejected"] == 1
     assert body["inserted"] == 0
@@ -530,15 +543,41 @@ def test_wrong_typed_model_field_is_rejected_not_escaped(store, no_auth):
 
 
 def test_wrong_typed_session_id_field_is_rejected_not_escaped(store, no_auth):
-    """session_id=["x"] (a list) passes validate_batch's truthiness-only
-    check and raises sqlite3.ProgrammingError when bound as a query
-    parameter. Must be contained, not escape as an unhandled 500/dropped
-    connection."""
+    """session_id=["x"] (a list) is now caught upstream by validate_batch's
+    task-03 type check on session_id and rejected `invalid_session_id` --
+    inverted from the original expectation that it escaped validate_batch's
+    truthiness-only check and only got caught downstream as
+    sqlite3.ProgrammingError. This is the most instructive artifact in the
+    goal: the old downstream net caught only types SQLite REFUSES (a list
+    raises ProgrammingError); types SQLite silently CONVERTS (true, false,
+    1e20) sailed through and double-billed. `_RECORD_DATA_ERRORS` still needs
+    sqlite3.ProgrammingError for the user_email={"a":1} case below, which
+    keeps exercising that downstream net for a field session_id's fix does
+    not cover.
+    """
     good = _record(request_id="req-good-sid")
     bad_sid = _record(request_id="req-bad-sid", session_id=["x"])
 
     status, body = _post("/v1/transcript-usage",
                           json.dumps([good, bad_sid]).encode())
+    assert status == 200
+    assert body["rejected"] == 1
+    assert body["inserted"] == 5
+    assert body["rejections"][0]["reason"] == "invalid_session_id"
+
+
+def test_wrong_typed_user_email_field_still_escapes_to_programming_error(store, no_auth):
+    """Kept alive: `_RECORD_DATA_ERRORS` still needs sqlite3.ProgrammingError
+    coverage for a field task 03's type-validation does NOT cover --
+    user_email={"a": 1} is truthy, passes validate_batch (which only checks
+    user_email for truthiness), and raises sqlite3.ProgrammingError when
+    bound as a query parameter, exactly as session_id used to before its
+    fix."""
+    good = _record(request_id="req-good-email")
+    bad_email = _record(request_id="req-bad-email", user_email={"a": 1})
+
+    status, body = _post("/v1/transcript-usage",
+                          json.dumps([good, bad_email]).encode())
     assert status == 200
     assert body["rejected"] == 1
     assert body["inserted"] == 5

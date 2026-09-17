@@ -58,11 +58,17 @@ THE WIRE PAYLOAD SCHEMA -- exactly these fields, nothing else
                                                        scratch-workspace case
                                                        and normalizes to the
                                                        'unknown' repo key.
-    entrypoint                      str, REQUIRED  -- must be exactly
-                                                       'claude-desktop'; any
-                                                       other value is rejected,
-                                                       server-side, regardless
-                                                       of what the client sent.
+    entrypoint                      str, REQUIRED  -- must be one of
+                                                       ALLOWED_ENTRYPOINTS
+                                                       ('claude-desktop',
+                                                       'cli', 'claude-vscode');
+                                                       any other value is
+                                                       rejected server-side,
+                                                       regardless of what the
+                                                       client sent. Stored
+                                                       verbatim (never
+                                                       overwritten) -- see
+                                                       map_record.
     query_source                    str, REQUIRED  -- one of 'main' |
                                                        'subagent' | 'auxiliary'
                                                        (the enum otel_store.py
@@ -144,9 +150,29 @@ TOKEN_TYPE_BY_FIELD = {
 #: otel_store.py:31's query_source enum.
 QUERY_SOURCES = frozenset({"main", "subagent", "auxiliary"})
 
-#: The only entrypoint this ingest path accepts. Enforced server-side, never
-#: trusting client-side filtering.
-ALLOWED_ENTRYPOINT = "claude-desktop"
+#: The entrypoints this ingest path accepts. Enforced server-side, never
+#: trusting client-side filtering. `claude-desktop` is exempt (in
+#: receiver.py) from the two OTLP-backfill checks below -- it has no OTLP
+#: exporter, so those checks exist only for `cli` / `claude-vscode`, which
+#: also emit OTLP metrics and would otherwise risk double-billing a session.
+ALLOWED_ENTRYPOINTS = frozenset({"claude-desktop", "cli", "claude-vscode"})
+
+#: Entrypoints exempt from the OTLP-membership and backfill-age checks
+#: (receiver.py). The desktop app has no OTLP exporter, so
+#: `sessions_with_otlp_rows` would always answer "no" for it anyway -- the
+#: check is pure cost -- and quarantining desktop records would delay or
+#: regress existing capture.
+DESKTOP_ENTRYPOINT = "claude-desktop"
+
+#: How old (in seconds) a `cli` / `claude-vscode` record's timestamp must be
+#: before this ingest path will accept it. Not an env var, not a CLI flag --
+#: a fixed contract value. Rationale: the SessionEnd hook and the OTLP
+#: exporter's shutdown flush race, so a session that ends *now* may still
+#: have OTLP rows arriving for it; 15 minutes makes the
+#: `sessions_with_otlp_rows` exclusion check meaningful instead of a coin
+#: flip. The comparison itself is performed in receiver.py -- this module has
+#: no clock (see the module docstring: "no I/O, no store access").
+BACKFILL_MIN_AGE_SECONDS = 900
 
 #: Maximum records per batch. Exported so task 06's hook can batch to this
 #: exact size. A batch larger than this is an unusable ENVELOPE (raises
@@ -175,6 +201,7 @@ EPOCH_FLOOR_NANO = 0
 REJECTION_REASONS = (
     "not_a_dict",
     "missing_field",           # missing_field:<name>
+    "invalid_session_id",      # present but not a str -- see _validate_record
     "invalid_ts",
     "invalid_entrypoint",
     "invalid_query_source",
@@ -183,6 +210,11 @@ REJECTION_REASONS = (
                                # interpolated when it matches
                                # _SAFE_FIELD_NAME; otherwise bare)
     "duplicate_request_id",
+    "session_has_otlp",        # receiver.py: cli/claude-vscode session already
+                               # has an OTLP row -- inserting would double-bill.
+    "too_recent",              # receiver.py: cli/claude-vscode record younger
+                               # than BACKFILL_MIN_AGE_SECONDS -- a final OTLP
+                               # flush for the session may still be in flight.
 )
 
 #: An unknown field NAME is client-controlled and unbounded. It is only
@@ -223,6 +255,22 @@ def _validate_record(record: Any) -> str | None:
         if not record.get(field):
             return f"missing_field:{field}"
 
+    # `session_id` must be a genuine str -- checked AFTER the truthiness loop
+    # so an absent id still reports `missing_field:session_id` (absent) and
+    # only a present-but-wrong-typed id reports `invalid_session_id`. This is
+    # the one billing-critical field that had no type check (ts, request_id,
+    # the token counts, entrypoint and query_source all do), and it is the key
+    # receiver.py's `sessions_with_otlp_rows` guard looks up. A non-str id is
+    # persisted through SQLite's TEXT affinity, whose conversion disagrees
+    # with Python's str() for `true` ('1' vs 'True'), `false` ('0' vs
+    # 'False') and `1e20` ('1.0e+20' vs '1e+20'), so the guard's key can never
+    # match the stored value and the record is billed on top of the session's
+    # OTLP rows. Rejecting the type here makes the two sides unable to
+    # diverge; mimicking SQLite's affinity rules in the guard would be a second
+    # implementation of the thing that already broke twice.
+    if not isinstance(record["session_id"], str):
+        return "invalid_session_id"
+
     # Parse `ts` HERE, not in map_record. A malformed ts that escaped
     # validation would raise from map_record, outside the per-record scope
     # task 03 wraps, and turn one bad record into a 400 for the whole batch
@@ -231,7 +279,7 @@ def _validate_record(record: Any) -> str | None:
     if not _validate_ts(record["ts"]):
         return "invalid_ts"
 
-    if record.get("entrypoint") != ALLOWED_ENTRYPOINT:
+    if record.get("entrypoint") not in ALLOWED_ENTRYPOINTS:
         return "invalid_entrypoint"
 
     if record.get("query_source") not in QUERY_SOURCES:
@@ -321,9 +369,13 @@ def _normalize_record(record: dict) -> dict:
     """Fill in defaults for optional fields on an already-validated record.
 
     Does NOT strip whitespace on session_id/request_id -- transcript_key
-    itself doesn't either; the store's insert_* methods do their own
-    stripping. Passing already-stripped input into transcript_key (if a
-    caller ever computes one directly) is the caller's job, per task 01.
+    itself doesn't either. Of the store's insert_* methods, only
+    `request_id` gets stripped there; `session_id` is persisted VERBATIM
+    (otel_store.py:51) and any guard that keys off it -- e.g. receiver.py's
+    `sessions_with_otlp_rows` lookup -- must match that verbatim value, not
+    a stripped one, or it will look up a key the table can never contain.
+    Passing already-stripped input into transcript_key (if a caller ever
+    computes one directly) is the caller's job, per task 01.
     """
     normalized = dict(record)
     normalized["repo_raw"] = normalized.get("repo_raw") or ""
@@ -516,7 +568,11 @@ def map_record(record: dict, rating: RatingService | None = None) -> dict:
         row = dict(base)
         row["token_type"] = token_type
         row["tokens"] = tokens
-        row["entrypoint"] = ALLOWED_ENTRYPOINT
+        # Preserve the record's OWN validated entrypoint (claude-desktop /
+        # cli / claude-vscode) -- overwriting it with a single constant here
+        # would store every backfilled cli/claude-vscode row as
+        # claude-desktop and misattribute per-surface usage.
+        row["entrypoint"] = record["entrypoint"]
         token_rows.append(row)
         total_cost += rating.raw_cost(record["model"], token_type, tokens)
 

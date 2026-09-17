@@ -374,7 +374,7 @@ def apply_config(obj: dict, endpoint: str, token: str) -> dict:
         "OTEL_METRICS_EXPORTER": "otlp",
         "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
         "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint,
-        "OTEL_METRIC_EXPORT_INTERVAL": "60000",
+        "OTEL_METRIC_EXPORT_INTERVAL": "10000",
         "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
         "OTEL_EXPORTER_OTLP_HEADERS": "X-Billing-Token=%s" % token,
         "CLAUDE_BILLING_RECEIVER": endpoint,

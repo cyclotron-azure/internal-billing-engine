@@ -85,7 +85,7 @@ line means anyone who can reach the port can write billing rows.
 `.claude/settings.local.json` (gitignored) points this machine at a local receiver,
 so a `claude` session in this repo produces real rows. `deploy/dev-selftest.sh` does
 the same as a one-off launcher without changing your settings. Telemetry starts with
-the **next** session, and exports every 60s — so give it a minute before checking.
+the **next** session, and exports every 10s — so give it a few seconds before checking.
 
 ---
 
@@ -390,7 +390,7 @@ sessions are permanently unbilled. Two viable postures:
 
 **No, negligibly.**
 
-- **Network** — one POST per `OTEL_METRIC_EXPORT_INTERVAL` (60s) per active
+- **Network** — one POST per `OTEL_METRIC_EXPORT_INTERVAL` (10s) per active
   session, gzipped JSON of a few KB. Delta temporality means idle minutes emit
   nothing.
 - **CPU** — the OTEL SDK batches on a background thread, inside a process already

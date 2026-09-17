@@ -53,7 +53,7 @@ Work top to bottom; each step has its own section below.
 | *(no `OTEL_LOGS_EXPORTER`)* | Billing needs metrics only — don't ship event logs (less traffic, less data exposure). Leave this **unset**: with it unset Claude Code exports no logs, which is exactly what we want. Do **not** set `OTEL_LOGS_EXPORTER=none` — Claude Code's logs exporter only handles `otlp` and `console`, so `none` is unrecognized and makes it error on startup and exit. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` | Matches the billing receiver. If you front the receiver with an OpenTelemetry Collector, you can switch to the more efficient `http/protobuf`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | **Replace the placeholder** with your hosted receiver/collector URL (HTTPS, reachable from dev machines over VPN/network). |
-| `OTEL_METRIC_EXPORT_INTERVAL=60000` | Export once a minute — fine for billing (not real-time). |
+| `OTEL_METRIC_EXPORT_INTERVAL=10000` | Export every 10s — bounds how much usage a session can take with it when it exits before a flush. |
 | `OTEL_METRICS_INCLUDE_SESSION_ID=true` | Keeps `session.id` on records (used for dedupe). |
 | `OTEL_EXPORTER_OTLP_HEADERS=X-Billing-Token=…` | **Replace the placeholder** with the fleet billing token — this is what the receiver checks on metric writes. |
 | `CLAUDE_BILLING_TOKEN=…` | Same token, read by the repo-tag hook for its `/v1/session-repo` writes. **Replace the placeholder.** |
@@ -252,7 +252,7 @@ session, so you can see how much of the bill each signal is carrying.
 | All `absent` for some users | Those sessions never passed through the wrapper *or* the hook — likely a non-CLI surface | Confirm the hook is in **managed** settings (applies to all surfaces), not just user settings |
 | Hook exits non-zero | `python3` missing on the PATH | Install it, or rewrite the hook for an interpreter you do ship |
 | Timeline entries exist but usage still bills to one repo | Datapoints and timeline don't share a `session_id` — check `OTEL_METRICS_INCLUDE_SESSION_ID` is `true` | It's `true` by default; don't set it to `false` |
-| Multi-repo session split looks wrong by a small amount | A repo switch inside one 60s export interval lands wholly on one side | Lower `OTEL_METRIC_EXPORT_INTERVAL` to tighten the window (more traffic) |
+| Multi-repo session split looks wrong by a small amount | A repo switch inside one 10s export interval lands wholly on one side | Expected at the current window; a false split this small is not worth further tightening (more traffic) |
 
 ---
 

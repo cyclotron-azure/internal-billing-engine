@@ -39,6 +39,7 @@ import json
 import os
 import sqlite3
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
@@ -46,7 +47,13 @@ from ..config import load_env
 from .normalize import normalize_remote
 from .otel_store import OtelStore
 from .rating import RatingService
-from .transcript import map_record, validate_batch
+from .transcript import (
+    ALLOWED_ENTRYPOINTS,
+    BACKFILL_MIN_AGE_SECONDS,
+    DESKTOP_ENTRYPOINT,
+    map_record,
+    validate_batch,
+)
 
 load_env()
 
@@ -54,6 +61,50 @@ TOKEN_METRIC = "claude_code.token.usage"
 COST_METRIC = "claude_code.cost.usage"
 LOG_PATH = os.environ.get("RECEIVER_LOG", "data/receiver.log")
 AUTH_TOKEN = os.environ.get("RECEIVER_AUTH_TOKEN", "").strip()
+
+#: Entrypoints subject to the OTLP-membership + backfill-age checks in
+#: `ingest_transcript_usage_payload`. Derived from transcript.py's
+#: ALLOWED_ENTRYPOINTS minus DESKTOP_ENTRYPOINT (the one entrypoint exempt
+#: from both checks -- see transcript.py's DESKTOP_ENTRYPOINT docstring for
+#: why) so a future addition to ALLOWED_ENTRYPOINTS is backfill-checked by
+#: default rather than silently exempted.
+_BACKFILL_ENTRYPOINTS = ALLOWED_ENTRYPOINTS - {DESKTOP_ENTRYPOINT}
+
+#: The `ts` column / `ingested_at` format every module in this codebase uses
+#: (otel_store.py's `_now`, transcript.py's `_unix_nano_to_ts`): UTC, whole
+#: seconds, `Z` suffix.
+_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _now() -> datetime:
+    """The single source of "now" for /healthz and the backfill-age check.
+
+    A module-level helper (never an inline `datetime.now()` at the
+    comparison site) so it can be monkeypatched to freeze time in tests --
+    the 15-minute backfill boundary and a future-stamped row both need a
+    frozen clock, not a `sleep`.
+    """
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.strftime(_TS_FORMAT)
+
+
+def _parse_store_ts(ts: str) -> datetime:
+    """Parse a store-format timestamp (`ingested_at`, or a mapped record's
+    `ts`) back into an aware UTC datetime."""
+    return datetime.strptime(ts, _TS_FORMAT).replace(tzinfo=timezone.utc)
+
+
+def _stale_seconds(ts: str | None, now: datetime) -> int | None:
+    """Whole seconds between `ts` and `now`, clamped to >= 0, or None when
+    `ts` is None -- "no rows ever" must stay distinguishable from "rows,
+    zero seconds old" (never collapse the former to 0)."""
+    if ts is None:
+        return None
+    delta = (now - _parse_store_ts(ts)).total_seconds()
+    return max(0, int(delta))
 
 
 def _presented_token(headers) -> str:
@@ -136,7 +187,38 @@ def _common(res: dict, dp: dict) -> dict:
     a.update(_attrs(dp.get("attributes")))  # datapoint attrs win
     repo_raw = a.get("repo")
     return {
-        "session_id": a.get("session.id") or "unknown",
+        # Coerce to str after the "unknown" fallback so SQLite's TEXT-affinity
+        # conversion is never the thing that decides the stored spelling —
+        # `_attr_value` can hand back int/float/bool, and letting SQLite coerce
+        # those produced spellings (e.g. '1' from boolValue true, '1.0e+20' from
+        # doubleValue 1e20) that disagreed with the str() spelling the transcript
+        # path and the OTLP-exclusion guard build, causing double-billing. This
+        # fixes future rows only: any row already stored under a non-str-derived
+        # spelling keeps that spelling (no backfill/migration here, deliberately
+        # out of scope), but none are expected in production since Claude Code
+        # session ids are UUIDs and can't arrive as intValue/doubleValue/boolValue.
+        #
+        # Residual (ii) -- this closes only the divergences SQLite itself caused,
+        # not every divergence in the reproduction. Three of the five reproduced
+        # double-billing cases survive this fix, unfixable here:
+        #   - intValue "0123" and intValue "+123" already lose their spelling one
+        #     line up, in `_attr_value`'s `int(v["intValue"])` -- Python discards
+        #     the leading zero/sign before this function, let alone SQLite, ever
+        #     sees the value. str() of an int can't recover a spelling Python has
+        #     already thrown away.
+        #   - doubleValue 42.0 can't be fixed by changing `_attr_value` at all:
+        #     `json.loads` has already produced the Python float 42.0 before
+        #     `_attr_value` runs, and `_attr_value` returns it untouched. Recovering
+        #     '42' would require `json.loads(..., parse_float=str)` at the body-parse
+        #     site, which would change every `asDouble` cost value and
+        #     `timeUnixNano` in the payload, not just session.id. Arguably it isn't
+        #     even a defect: if the producer sent the number 42.0, '42.0' is the
+        #     faithful spelling, and a transcript record claiming '42' for the same
+        #     session is asserting a different id, not a matching one.
+        # This fix is therefore partial by design, not by oversight: it does not
+        # close the normalization-asymmetry class, only the slice of it that this
+        # function's own str() can affect.
+        "session_id": str(a.get("session.id") or "unknown"),
         "repo": normalize_remote(repo_raw),
         "repo_raw": repo_raw or "",
         "user_email": a.get("user.email") or "",
@@ -214,13 +296,16 @@ def ingest_session_repo_payload(payload: dict, store: OtelStore) -> dict:
 #: Data-shape exceptions caught PER RECORD around both map_record and the
 #: store inserts. This is deliberately broader than ValueError alone.
 #:
-#: `transcript._validate_record` only type-checks 5 of the 15 payload
-#: fields (`ts` and the four token-count fields) -- `session_id`,
-#: `request_id`, `model`, `repo_raw`, `user_email`, `user_id`, and `org_id`
-#: are checked for TRUTHINESS only, never TYPE. A client that sends
-#: `"session_id": ["x"]` or `"model": 123` or `"user_email": {"a": 1}`
-#: passes validate_batch and then raises downstream of it -- reproduced,
-#: per field:
+#: `transcript._validate_record` only type-checks 6 of the 15 payload
+#: fields (`session_id` -- added in task 03 fix cycle 2, reason
+#: `invalid_session_id`, because it is the key the OTLP guard below looks up
+#: -- plus `ts` and the four token-count fields). `request_id`, `model`,
+#: `repo_raw`, `user_email`, `user_id`, and `org_id` are still checked for
+#: TRUTHINESS only, never TYPE. A client that sends `"model": 123` or
+#: `"user_email": {"a": 1}` passes validate_batch and then raises downstream
+#: of it -- reproduced, per field (the `session_id=["x"]` case below is now
+#: caught upstream by validate_batch; it is kept as the record of why this
+#: tuple includes sqlite3.ProgrammingError):
 #:     session_id=["x"]   -> sqlite3.ProgrammingError (unhashable/unbindable
 #:                            parameter type)
 #:     model=123           -> TypeError (RatingService._base does
@@ -345,6 +430,43 @@ def ingest_transcript_usage_payload(payload: Any, store: OtelStore) -> dict:
     rejected_indices = {r["index"] for r in rejected}
     accepted_indices = [i for i in range(len(payload)) if i not in rejected_indices]
 
+    # --- OTLP exclusion, computed ONCE for the whole batch --------------
+    #
+    # cli / claude-vscode entrypoints also emit OTLP metrics (unlike
+    # claude-desktop, which is exempt from this check entirely -- see
+    # transcript.DESKTOP_ENTRYPOINT), so a transcript backfill record for a
+    # session that already has an OTLP row would double-bill it.
+    # `sessions_with_otlp_rows` is called at most once per batch, never once
+    # per record, with the batch's DISTINCT session ids.
+    #
+    # Two preconditions established by task 02's evaluation, both of which
+    # fail in the double-billing direction (a `set()` reads downstream as
+    # "no OTLP rows -- safe to insert"):
+    #   (a) never let None reach `sessions_with_otlp_rows` -- build the id
+    #       collection explicitly and only call it when non-empty.
+    #   (b) pass `str` ids only -- `[123]` would normalize to the stored
+    #       string `{'123'}`, and `123 in result` is False even though that
+    #       session really does have OTLP rows.
+    # Deliberately `str(...)` with NO `.strip()`: the store persists
+    # `session_id` verbatim (unlike `request_id`, which insert_datapoint
+    # strips -- see otel_store.py:51), and `sessions_with_otlp_rows` compares
+    # verbatim too. Stripping here would build a lookup key the table can
+    # never contain for a whitespace-padded session id, so the guard would
+    # always answer `set()` for it -- "no OTLP rows, safe to insert" -- which
+    # is exactly the double-billing direction this check exists to prevent.
+    # The build site (here) and the lookup site (`session_key` below) must
+    # both match THE STORE, not merely match each other.
+    backfill_session_ids = sorted({
+        str(record["session_id"])
+        for record in accepted
+        if record.get("entrypoint") in _BACKFILL_ENTRYPOINTS
+    })
+    otlp_sessions = (
+        store.sessions_with_otlp_rows(backfill_session_ids)
+        if backfill_session_ids else set()
+    )
+
+    now = _now()
     rating = RatingService()
     tok_ins = tok_dup = cost_ins = cost_dup = 0
     try:
@@ -352,8 +474,33 @@ def ingest_transcript_usage_payload(payload: Any, store: OtelStore) -> dict:
             request_id = record.get("request_id")
             if not isinstance(request_id, str):
                 request_id = None
+            entrypoint = record.get("entrypoint")
             try:
                 mapped = map_record(record, rating)
+
+                # claude-desktop is exempt from BOTH checks below: it has no
+                # OTLP exporter (sessions_with_otlp_rows would always answer
+                # "no" for it -- pure cost) and quarantining its records
+                # would delay/regress existing capture.
+                if entrypoint in _BACKFILL_ENTRYPOINTS:
+                    session_key = str(record["session_id"])
+                    if session_key in otlp_sessions:
+                        rejected.append({"index": index, "request_id": request_id,
+                                          "reason": "session_has_otlp"})
+                        continue
+                    # Quarantine: the SessionEnd hook and the OTLP exporter's
+                    # shutdown flush race, so a session that ended just now
+                    # may still have OTLP rows arriving for it -- accepting a
+                    # backfill record too early would let both land. Clamp a
+                    # future-stamped record's age to 0 rather than letting it
+                    # go negative and slip under the threshold.
+                    age_seconds = max(
+                        0.0, (now - _parse_store_ts(mapped["ts"])).total_seconds())
+                    if age_seconds < BACKFILL_MIN_AGE_SECONDS:
+                        rejected.append({"index": index, "request_id": request_id,
+                                          "reason": "too_recent"})
+                        continue
+
                 for row in mapped["token_rows"]:
                     ok = store.insert_datapoint(**row)
                     tok_ins += 1 if ok else 0
@@ -425,6 +572,54 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("WWW-Authenticate", "Bearer")
         self.end_headers()
         self.wfile.write(body)
+
+    def _json(self, status: int, obj: dict):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _healthz(self):
+        """GET /healthz -- liveness to anyone, ingest-freshness detail to an
+        authorized caller only.
+
+        The detail gate is `AUTH_TOKEN and self._authorized()` -- BOTH
+        halves. `_authorized()` alone returns True whenever
+        RECEIVER_AUTH_TOKEN is unset (the documented open-receiver rollout
+        posture), so using it alone here would hand freshness detail to any
+        prober AND would make the body's shape (2 keys vs. 6) disclose
+        whether a token is configured at all. Requiring a non-empty
+        AUTH_TOKEN in addition means detail is never served on an open
+        receiver -- `_authorized()` itself is reused unmodified for the
+        actual credential check.
+        """
+        now = _now()
+        body: dict = {"status": "ok", "now": _iso(now)}
+        if AUTH_TOKEN and self._authorized():
+            try:
+                last = self.store.last_ingest_at()
+                last_otlp = self.store.last_ingest_at(usage_source="otlp")
+            except sqlite3.Error:
+                # Can't read our own database -- that's not healthy, and the
+                # exception text may name file paths, so it never reaches
+                # the response body.
+                self._json(503, {"status": "degraded"})
+                return
+            body["last_ingest_at"] = last
+            body["last_otlp_ingest_at"] = last_otlp
+            body["stale_seconds"] = _stale_seconds(last, now)
+            body["otlp_stale_seconds"] = _stale_seconds(last_otlp, now)
+        self._json(200, body)
+
+    def do_GET(self):
+        path = self.path.rstrip("/")
+        if path.endswith("/healthz"):
+            self._healthz()
+            return
+        self.send_response(404)
+        self.end_headers()
 
     def do_POST(self):
         # Reject before reading/parsing the body: an unauthenticated caller
@@ -512,7 +707,8 @@ def serve(host: str, port: int, db: str | None = None, require_auth: bool = Fals
     server = HTTPServer((host, port), Handler)
     auth_state = "ENABLED" if AUTH_TOKEN else "DISABLED"
     print(f"[receiver] listening on http://{host}:{port}  auth={auth_state}  "
-          f"(POST /v1/metrics, /v1/session-repo, /v1/transcript-usage)")
+          f"(POST /v1/metrics, /v1/session-repo, /v1/transcript-usage; "
+          f"GET /healthz)")
     if not AUTH_TOKEN:
         print("[receiver] WARNING: RECEIVER_AUTH_TOKEN is unset — any client that can "
               "reach this port can write billing rows. Set it to require a token.")

@@ -258,3 +258,120 @@ sentence, and the `__cost__` row's column offsets. Both are still covered --
 `test_03_5_four_qualifiers_wording_and_no_bare_count_when_empty` asserts the qualifier
 text and the absence of a bare count without pinning full-sentence punctuation beyond
 that, and no test in this file asserts a byte-offset for the `__cost__` label.
+
+---
+
+# Coverage map: `otel-export-loss-reduction`
+
+Maps every acceptance criterion in `_goals/otel-export-loss-reduction/01-export-interval.md`,
+`02-store-reads.md`, `03-receiver-health-and-cli-ingest.md`,
+`04-sweeper-cli-backfill.md` and `06-otlp-session-id-coercion.md` to the test node
+id(s) that verify it. Task 06's criteria live in `tests/test_receiver_health.py`
+(alongside task 03) because both tasks modify `billing/otel/receiver.py`'s ingest
+paths and task 06's fix (`_common`'s session-id coercion) is exercised through the
+same `/v1/metrics` + `/v1/transcript-usage` harness. Task 01's criteria live in
+`tests/test_cli_backfill.py` alongside task 04, per this task's write fence.
+
+## Task 01 — `01-export-interval.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. All four config sources carry `10000`; `dev-selftest.sh` keeps `5000` | `test_cli_backfill.py::test_01_ac01_all_four_config_sources_carry_10000_dev_selftest_keeps_5000` |
+| 2. `managed-settings.json` / `pilot-package/settings.json` carry string `"10000"` | `test_cli_backfill.py::test_01_ac02_managed_settings_and_pilot_settings_carry_string_10000` |
+| 3. `configure.py` parses; defaults dict resolves to `"10000"` | `test_cli_backfill.py::test_01_ac03_configure_py_parses_and_defaults_resolve_to_10000` |
+| 4. `install.sh` parses; emitted settings block is valid JSON with the new value | `test_cli_backfill.py::test_01_ac04_install_sh_parses_and_emits_valid_json_with_new_value` |
+| 5. No `60s`/`60000` describing the current export interval in `deploy/README.md`/`README.md` | `test_cli_backfill.py::test_01_ac05_no_60s_or_60000_describing_current_interval` |
+| 6. `git diff --stat` touches exactly the six files in task 01's write set | `test_cli_backfill.py::test_01_ac06_git_diff_stat_touches_exactly_the_six_files` |
+| 7. No pre-existing test asserts the old `60000` value | `test_cli_backfill.py::test_01_ac07_no_test_asserts_the_old_60000_value` |
+
+## Task 02 — `02-store-reads.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. `last_ingest_at()` on empty store returns `None` | `test_store_reads.py::test_ac01_last_ingest_at_empty_store_returns_none` |
+| 2. Max across both tables, insert order irrelevant | `test_store_reads.py::test_ac02_last_ingest_at_is_max_across_both_tables_out_of_order` |
+| 3. `usage_source` filter actually filters (one fixture, two assertions) | `test_store_reads.py::test_ac03_usage_source_filter_ignores_newer_transcript_row` |
+| 4. Reads `ingested_at`, not `ts` | `test_store_reads.py::test_ac04_reads_ingested_at_not_ts` |
+| 5. Empty input: `set()`, zero queries (execute-spy) | `test_store_reads.py::test_ac05_empty_session_ids_returns_empty_set_zero_queries` |
+| 6. 1200 ids, 3 exist -> those 3, 3 statements | `test_store_reads.py::test_ac06_chunking_over_1200_ids_three_exist_three_statements` |
+| 7. 600 copies of one id -> 1 id, 1 statement | `test_store_reads.py::test_ac07_600_duplicate_ids_dedupe_to_one_statement` |
+| 8. Transcript-only excluded; OTLP+transcript included | `test_store_reads.py::test_ac08_transcript_only_session_excluded_mixed_session_included` |
+| 9. `entrypoint IS NULL` OTLP row is returned, built via `insert_datapoint` | `test_store_reads.py::test_ac09_entrypoint_null_otlp_row_is_returned` |
+| 10. SQL metacharacter session id: no match, no raise | `test_store_reads.py::test_ac10_sql_metacharacter_session_id_no_match_no_raise` |
+| 11. Both methods write nothing (execute-spy + full-file sha256) | `test_store_reads.py::test_ac11_read_methods_write_nothing_spy_and_sha256` |
+| 12. `git diff` on `otel_store.py` is additions only | `test_store_reads.py::test_ac12_git_diff_otel_store_is_additions_only` |
+| 13. C1: cost-only session via `insert_cost_datapoint` alone is returned | `test_store_reads.py::test_ac13_cost_only_session_via_insert_cost_datapoint_alone_is_returned` |
+| 14. `last_ingest_at` reflects a newer `cost_usage` row, filtered and unfiltered | `test_store_reads.py::test_ac14_last_ingest_at_reflects_newer_cost_row` |
+| 15. Parameter-cap regression: 500-id chunk under `setlimit(999)` | `test_store_reads.py::test_ac15_full_500_id_chunk_succeeds_under_999_variable_cap` |
+
+## Task 03 — `03-receiver-health-and-cli-ingest.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. Unauthenticated `/healthz` key set `{"status","now"}`, both token states | `test_receiver_health.py::test_ac01_unauthenticated_healthz_key_set`, `test_ac01_unauthenticated_healthz_key_set_with_auth_configured` |
+| 2. Authorized `/healthz` detail fields correct against a seeded store | `test_receiver_health.py::test_ac02_authorized_healthz_has_correct_detail_fields` |
+| 3. Wrong bearer token -> liveness-only body, status 200 | `test_receiver_health.py::test_ac03_wrong_token_gets_liveness_only_status_200` |
+| 4. Unauthenticated body leaks no token substring | `test_receiver_health.py::test_ac04_unauthenticated_body_has_no_token_substring` |
+| 5. Empty store: `last_ingest_at`/`stale_seconds` both null | `test_receiver_health.py::test_ac05_empty_store_null_last_ingest_and_stale_seconds` |
+| 6. 3h-old row -> `stale_seconds`~10800; future row clamped to 0 | `test_receiver_health.py::test_ac06_stale_seconds_3h_old_and_future_clamped_to_zero` |
+| 7. `last_otlp_ingest_at` ignores newer transcript row | `test_receiver_health.py::test_ac07_otlp_stale_ignores_newer_transcript_row` |
+| 8. `GET` to other paths -> 404 | `test_receiver_health.py::test_ac08_get_other_paths_404` (parametrized, 3 cases) |
+| 9. Store error -> 503 degraded, no leak | `test_receiver_health.py::test_ac09_store_error_yields_503_degraded_no_leak` |
+| 10. `cli` rejected `session_has_otlp`, both table shapes, counts unchanged | `test_receiver_health.py::test_ac10_cli_rejected_when_session_has_token_usage_otlp_row`, `test_ac10_cli_rejected_when_session_has_only_cost_usage_otlp_row` |
+| 11/12. Backfill entrypoint accepted, stored verbatim | `test_receiver_health.py::test_ac11_ac12_backfill_entrypoint_accepted_and_stored_verbatim` (parametrized, 2 cases) |
+| 13. Quarantine boundary: 60s rejected `too_recent`, 2h accepted | `test_receiver_health.py::test_ac13_quarantine_boundary_too_recent_then_accepted` |
+| 14. Desktop exempt from both checks, asserted positively | `test_receiver_health.py::test_ac14_desktop_exempt_from_otlp_check_and_quarantine` |
+| 15. Out-of-set entrypoint still `invalid_entrypoint` | `test_receiver_health.py::test_ac15_out_of_set_entrypoint_still_rejects_invalid_entrypoint` |
+| 16. `sessions_with_otlp_rows` called once, arg not None, all `str` | `test_receiver_health.py::test_ac16_sessions_with_otlp_rows_called_once_with_str_ids` |
+| 17. Mixed batch: cli rejected, desktop inserted, same session | `test_receiver_health.py::test_ac17_mixed_batch_cli_rejected_desktop_inserted_same_session` |
+| 18. Only the four named pre-existing tests broken (documented) | `test_receiver_health.py::test_ac18_only_the_four_named_preexisting_tests_are_inverted` |
+| 19. `/healthz` opens no new connection while a POST is possible | `test_receiver_health.py::test_ac19_healthz_does_not_open_a_new_connection` |
+| 20. Whitespace-padded session id still excludes, verbatim | `test_receiver_health.py::test_ac20_whitespace_padded_session_id_still_excludes` |
+| 21. Type-conversion class (`true`/`1e20`) rejected `invalid_session_id`, not double-billed | `test_receiver_health.py::test_ac21_non_str_session_id_rejected_not_double_billed` (parametrized, 2 cases) |
+
+## Task 04 — `04-sweeper-cli-backfill.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. `cli` transcript aged 2h ships `entrypoint=="cli"` | `test_cli_backfill.py::test_04_ac01_cli_transcript_aged_2h_ships_with_entrypoint_cli` |
+| 2. Same fixture aged 60s produces no record | `test_cli_backfill.py::test_04_ac02_cli_transcript_aged_60s_produces_no_record` |
+| 3. THE TRAP: withhold state, then ships after the window | `test_cli_backfill.py::test_04_ac03_quarantine_withholds_state_then_ships_after_window` |
+| 4. `claude-desktop` aged 60s still ships | `test_cli_backfill.py::test_04_ac04_desktop_aged_60s_still_ships` |
+| 5. Missing entrypoint: no record, no raise, marked resolved | `test_cli_backfill.py::test_04_ac05_missing_entrypoint_no_record_no_raise_marked_resolved` |
+| 6. Out-of-set entrypoint: no record, IS resolved | `test_cli_backfill.py::test_04_ac06_out_of_set_entrypoint_no_record_is_resolved` |
+| 7. Mixed root ships exactly 2 with expected entrypoints | `test_cli_backfill.py::test_04_ac07_mixed_root_ships_exactly_two_expected_entrypoints` |
+| 8. Malformed timestamp: no raise, other sessions still ship | `test_cli_backfill.py::test_04_ac08_malformed_timestamp_no_raise_other_sessions_ship` |
+| 9. Exit code 0 on every path, including read-only state dir | `test_cli_backfill.py::test_04_ac09_exit_zero_including_read_only_state_dir` |
+| 10. The two copies are byte-identical | `test_cli_backfill.py::test_04_ac10_client_and_deploy_copies_are_byte_identical` |
+| 11. Client-package hook parses as valid Python | `test_cli_backfill.py::test_04_ac11_client_package_hook_parses_as_valid_python` |
+| 12. `too_recent` non-resolving; `session_has_otlp` resolving | `test_cli_backfill.py::test_04_ac12_too_recent_non_resolving_session_has_otlp_resolving` |
+| 13. Replay runs once, actually re-scans | `test_cli_backfill.py::test_04_ac13_replay_runs_once_and_actually_rescans` |
+| 14. Replay crash-safe: flag persists, remainder still ships | `test_cli_backfill.py::test_04_ac14_replay_is_crash_safe_flag_persists_and_remainder_ships` |
+| 15. Replay does not bypass quarantine/entrypoint filter | `test_cli_backfill.py::test_04_ac15_replay_does_not_bypass_quarantine_or_entrypoint_filter` |
+| 16. Recovery reported; `shipped` counts only accepted | `test_cli_backfill.py::test_04_ac16_recovery_reported_shipped_counts_only_accepted` |
+| 17. Desktop replay reshipping does not duplicate rows (token + cost) | `test_cli_backfill.py::test_04_ac17_desktop_replay_reshipping_does_not_duplicate_rows` |
+| 18. Only the two named pre-existing hook tests broken (documented) | `test_cli_backfill.py::test_04_ac18_only_the_two_named_hook_tests_are_inverted` |
+| 19. Pre-installation history excluded, even on replay | `test_cli_backfill.py::test_04_ac19_pre_installation_history_excluded_even_on_replay` |
+
+## Task 06 — `06-otlp-session-id-coercion.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. `doubleValue 1e20` / `boolValue true` now exclude correctly | `test_receiver_health.py::test_06_ac01_double_1e20_and_bool_true_now_exclude_correctly` (parametrized, 2 cases) |
+| 2. Four already-correct wrappers stay correct; absent -> `unknown` | `test_receiver_health.py::test_06_ac02_already_correct_wrappers_stay_correct` (parametrized, 3 cases), `test_06_ac02_absent_session_id_stores_unknown` |
+| 3. `typeof(session_id)=='text'`, equals `str(python value)` for all 9 wrappers | `test_receiver_health.py::test_06_ac03_typeof_session_id_is_text_and_equals_str_python_value` (parametrized, 5 cases) |
+| 4. `dp_key` unchanged by coercion; dedupe intact | `test_receiver_health.py::test_06_ac04_dp_key_unchanged_by_coercion_and_dedupe_intact` |
+| 5. Ordinary UUID session is byte-identical to the pre-fix value | `test_receiver_health.py::test_06_ac05_ordinary_uuid_session_is_byte_identical_to_prefix_value` |
+| 6. Absent/falsy `session.id` still stores `unknown` | `test_receiver_health.py::test_06_ac06_falsy_or_absent_session_id_stores_unknown` (parametrized, 3 cases) |
+| 7. `user_email={"a":1}` still `store_error:ProgrammingError` (new test, per orchestrator correction) | `test_receiver_health.py::test_06_ac07_user_email_dict_still_raises_programming_error` |
+| 8. Targeted five-file selection: 8 failed / 166 passed, all owned by task 05 | Property of the full targeted run (see this task's completion report); the eight are inverted in `test_transcript.py`, `test_receiver.py`, `test_transcript_hook.py`, `test_integration_desktop.py` per the seven-hunk list above. |
+| 9. `git diff` on `receiver.py` confined to `_common` plus comments | `test_receiver_health.py::test_06_ac09_other_ingest_paths_unaffected_by_common_coercion` (behavioral confinement -- a byte-level `git diff` isolation needs the pre-task-06 scratchpad snapshot, not available to a durable checked-in test; see the test's own docstring) |
+
+## GAPs (explicit)
+
+Criterion 03.18's and 04.18's "list every pre-existing test your change breaks" are
+documentation properties, not independently re-derivable by a unit test -- both are
+represented above by a lightweight pin test that checks the expected test names/negative
+cases are present, per this goal's context package. Task 06 criterion 8 (the targeted
+five-file failure count) is a command-output property of the full run, not a single node
+id, consistent with how other command-output criteria are handled elsewhere in this file.

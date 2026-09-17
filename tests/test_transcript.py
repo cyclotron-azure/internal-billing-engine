@@ -129,11 +129,26 @@ def test_entrypoint_present_on_token_rows_and_absent_from_cost_row():
     assert "entrypoint" not in mapped["cost_row"]
 
 
-# --- AC2: entrypoint rejection --------------------------------------------
+# --- AC2: entrypoint acceptance / rejection --------------------------------
+#
+# Inverted for otel-export-loss-reduction task 03: `cli` and `claude-vscode`
+# are now members of ALLOWED_ENTRYPOINTS, not rejected. The old expectation
+# is kept alive below against a genuinely out-of-set entrypoint
+# (`claude-web`), which must still reject with the unchanged reason string.
 
 @pytest.mark.parametrize("entrypoint", ["cli", "claude-vscode"])
-def test_ac2_non_desktop_entrypoint_rejected(entrypoint):
+def test_ac2_backfill_entrypoint_now_accepted(entrypoint):
     accepted, rejected = validate_batch([_record(entrypoint=entrypoint)])
+    assert rejected == []
+    assert len(accepted) == 1
+    assert accepted[0]["entrypoint"] == entrypoint
+
+
+def test_ac2_non_desktop_entrypoint_rejected():
+    """Kept alive against a genuinely out-of-set entrypoint -- the OTLP-
+    exclusion / quarantine checks live in receiver.py, not here; this module
+    only enforces membership in ALLOWED_ENTRYPOINTS."""
+    accepted, rejected = validate_batch([_record(entrypoint="claude-web")])
     assert accepted == []
     assert len(rejected) == 1
     assert rejected[0]["reason"] == "invalid_entrypoint"
@@ -367,6 +382,10 @@ def test_ac4_mixed_batch_good_records_survive_alongside_bad_one():
 
 
 def test_rejection_index_is_original_batch_position_in_larger_mixed_batch():
+    # req-2 (entrypoint="cli") is now ACCEPTED (task 03 widens
+    # ALLOWED_ENTRYPOINTS) -- inverted from the original expectation, which
+    # pinned "cli" as rejected. req-6 (entrypoint="claude-web", genuinely
+    # out-of-set) keeps that original rejection coverage alive.
     batch = [
         _record(request_id="req-0"),
         _record(request_id="req-1", cwd="/x"),
@@ -374,11 +393,13 @@ def test_rejection_index_is_original_batch_position_in_larger_mixed_batch():
         _record(request_id="req-3"),
         _record(request_id="req-4", ts="garbage"),
         _record(request_id="req-5", input_tokens=-1),
+        _record(request_id="req-6", entrypoint="claude-web"),
     ]
     accepted, rejected = validate_batch(batch)
-    assert [r["request_id"] for r in accepted] == ["req-0", "req-3"]
-    assert [r["index"] for r in rejected] == [1, 2, 4, 5]
-    assert [r["request_id"] for r in rejected] == ["req-1", "req-2", "req-4", "req-5"]
+    assert [r["request_id"] for r in accepted] == ["req-0", "req-2", "req-3"]
+    assert [r["index"] for r in rejected] == [1, 4, 5, 6]
+    assert [r["request_id"] for r in rejected] == ["req-1", "req-4", "req-5", "req-6"]
+    assert rejected[-1]["reason"] == "invalid_entrypoint"
 
 
 # --- Rejection shape is content-free (contract for task 03) ---------------

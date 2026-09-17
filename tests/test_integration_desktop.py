@@ -387,16 +387,41 @@ def test_systemic_alarm_silent_for_ordinary_mixed_batch(tmp_path):
 def test_systemic_alarm_silent_for_pure_validation_rejections(tmp_path):
     """A validate_batch-level rejection (e.g. invalid_entrypoint) is ordinary
     client-data noise, not a store failure -- must not trip the alarm even
-    when it is the batch's only rejection."""
+    when it is the batch's only rejection.
+
+    Inverted for otel-export-loss-reduction task 03: `entrypoint="cli"` is no
+    longer rejected (cli/claude-vscode are now accepted backfill
+    entrypoints), so the out-of-set entrypoint (claude-web) is used here
+    instead to keep exercising this same validate_batch-level rejection
+    path -- the CLI-specific ingest="cli" record must instead call this
+    function with `entrypoint="cli"` via receiver.ingest_transcript_usage_payload
+    directly, whose default entrypoint used elsewhere in this module is
+    "claude-desktop"."""
     store = OtelStore(str(tmp_path / "valonly.db"))
     good = _full_record(request_id="req-good-2")
-    bad_entrypoint = _full_record(request_id="req-bad-entry", entrypoint="cli",
+    bad_entrypoint = _full_record(request_id="req-bad-entry", entrypoint="claude-web",
                                   session_id="sess-bad-entry")
 
     result = receiver.ingest_transcript_usage_payload([good, bad_entrypoint], store)
 
     assert result["rejected"] == 1
     assert result["rejections"][0]["reason"] == "invalid_entrypoint"
+    assert _systemic_store_failure_signature(result) is False
+    store.close()
+
+
+def test_systemic_alarm_silent_for_cli_entrypoint_now_accepted(tmp_path):
+    """The other half of the inversion: a `cli` record with no OTLP row and
+    an old-enough timestamp is now ACCEPTED end to end, so it must not
+    contribute a rejection at all -- and must not trip the systemic alarm."""
+    store = OtelStore(str(tmp_path / "cli_accepted.db"))
+    good = _full_record(request_id="req-good-3")
+    cli_record = _full_record(request_id="req-cli-accepted", entrypoint="cli",
+                               session_id="sess-cli-accepted", ts="2026-01-01T00:00:00Z")
+
+    result = receiver.ingest_transcript_usage_payload([good, cli_record], store)
+
+    assert result["rejected"] == 0
     assert _systemic_store_failure_signature(result) is False
     store.close()
 

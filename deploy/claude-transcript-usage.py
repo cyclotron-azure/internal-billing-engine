@@ -86,6 +86,47 @@ import of it -- keep the two in sync by hand; a test in
 
 Claude Code does NOT pass `OTEL_*` environment variables to hook
 subprocesses -- this file never reads them.
+
+Entrypoints shipped: `claude-desktop`, `cli`, and `claude-vscode` -- matching
+`billing/otel/transcript.py`'s `ALLOWED_ENTRYPOINTS` exactly (duplicated
+below, not imported: this file cannot import `billing/`). `cli` and
+`claude-vscode` sessions ALSO emit OTLP metrics via the exporter, so this
+hook is a BACKFILL path for gaps in that OTLP capture (a crash, a
+force-quit, or an exporter flush that never lands before the process dies)
+-- not a duplicate of it. The receiver-side guards that make this safe
+(`sessions_with_otlp_rows` exclusion, `BACKFILL_MIN_AGE_SECONDS`) live in
+`billing/otel/receiver.py` / `transcript.py`; this file additionally
+quarantines a `cli`/`claude-vscode` record client-side (see
+`BACKFILL_MIN_AGE_SECONDS` below) before ever attempting to ship it.
+
+One-time historical replay (2026-09-16): the first run of this version of
+the hook -- detected by the absence of the `cli_backfill_replay_at` state
+key -- clears every file's `resolved` list and `examined_mtime`, then
+performs an ordinary scan/ship pass so that previously-unshippable
+`cli`/`claude-vscode` history (discarded forever by every earlier version of
+this hook, which resolved those rows without ever shipping them) becomes
+eligible instead of only sessions from here forward. It deliberately does
+NOT touch the `install_ts` watermark: `install_ts` is set to the real
+install time on a machine's first-ever run, so every transcript written
+after installation already passes the forward-only watermark check on its
+own -- what actually blocked recovery was `resolved`/`examined_mtime`, not
+the watermark. Resetting `install_ts` would add nothing to this goal's
+target and would instead make PRE-installation history shippable too (for
+`claude-desktop` as well as CLI); that usage was never captured by OTLP
+either, because the tool was not installed yet, so billing it now would
+expand a client's invoices retroactively rather than recover lost
+telemetry. Do not "fix" this by reintroducing a watermark reset -- it was
+tried and deliberately removed for exactly this reason.
+This is a STATE RESET, not a second code path -- it flows through the exact
+same `_build_candidates` / shipping loop as any other run, and is subject to
+the same quarantine, entrypoint filter, and install watermark. It runs at
+most once per machine (the flag, once written, is never cleared by this
+code -- deleting it by hand is the intentional escape hatch). Expect
+`reconcile --detail`'s `DEDUPE DROPS` section to show a one-day cliff around
+2026-09-16 on machines that pick up this version: the replay re-POSTs
+already-known `claude-desktop`
+records too, and the store's `INSERT OR IGNORE` correctly no-ops them --
+that is the replay working as designed, not a `dp_key` collision.
 """
 
 from __future__ import annotations
@@ -126,9 +167,34 @@ TOKEN = os.environ.get("CLAUDE_BILLING_TOKEN", "").strip()
 #: cannot import billing/. Keep in sync by hand; cross-checked by test.
 MAX_BATCH_SIZE = 500
 
-#: The only entrypoint this hook ever ships. CLI and VS Code already bill
-#: via OTLP; shipping them here would double-bill.
-ENTRYPOINT = "claude-desktop"
+#: The entrypoints this hook ships. DUPLICATE of billing/otel/transcript.py's
+#: ALLOWED_ENTRYPOINTS -- this file cannot import billing/, keep the two
+#: values in sync by hand. CLI and VS Code do NOT already bill by themselves
+#: -- their OTLP exporter can miss a session entirely (crash, force-quit, a
+#: shutdown flush that never lands); this hook is the backfill path for
+#: exactly that gap. The receiver's own guards (session-already-has-OTLP-rows
+#: exclusion, and the age quarantine below) are what prevent double-billing,
+#: not this filter.
+ENTRYPOINT = frozenset({"claude-desktop", "cli", "claude-vscode"})
+
+#: DUPLICATE of billing/otel/transcript.py's DESKTOP_ENTRYPOINT. The desktop
+#: app has no OTLP exporter, so it is exempt from the age quarantine below --
+#: quarantining it would only delay/regress capture that carries no
+#: double-billing risk in the first place.
+DESKTOP_ENTRYPOINT = "claude-desktop"
+
+#: How old (in seconds) a cli/claude-vscode record's terminal-row timestamp
+#: must be before this hook will attempt to ship it. Deliberately TWICE
+#: billing/otel/transcript.py's server-side BACKFILL_MIN_AGE_SECONDS (900s)
+#: -- duplicated, not imported. A record that clears this looser client-side
+#: gate but still fails the server's tighter 900s check (clock skew between
+#: machines, or latency between candidate-building here and the POST landing
+#: on the receiver) is PERMANENTLY BURNED: the resolve-on-200 path in run()
+#: marks every record in an HTTP-200 chunk resolved regardless of its own
+#: per-record rejection. A client window strictly larger than the server's
+#: makes that boundary unreachable in practice -- belt and braces, in the
+#: safe direction. Does NOT apply to claude-desktop (see DESKTOP_ENTRYPOINT).
+BACKFILL_MIN_AGE_SECONDS = 1800
 
 #: Observed real streaming window for a cumulative block group: ~6 seconds
 #: (21:19:53.999 -> 21:20:00.187). 30s is a wide safety margin -- long
@@ -376,13 +442,17 @@ def build_payload_record(terminal_row: dict, *, is_sidechain: bool, identity: di
         "cache_read_input_tokens": _num(usage.get("cache_read_input_tokens")),
         "cache_creation_input_tokens": _num(usage.get("cache_creation_input_tokens")),
         "repo_raw": repo_raw,
-        # Carried from the row, not stamped -- the caller has already
-        # filtered to ENTRYPOINT before reaching here (this value will
-        # always equal it today), but reading it back off the row means the
-        # entrypoint filter and the payload's claimed entrypoint can never
-        # drift apart under a future refactor -- a second, structural
-        # defense on top of the filter itself.
-        "entrypoint": terminal_row.get("entrypoint") or ENTRYPOINT,
+        # Carried from the row, VERBATIM -- never stamped/relabeled. The
+        # caller has already validated this value is a member of the
+        # ENTRYPOINT set before reaching here, so this simply reads it back
+        # off the row rather than re-deriving it, meaning the entrypoint
+        # filter and the payload's claimed entrypoint can never drift apart
+        # under a future refactor. Do NOT reintroduce an `or ENTRYPOINT`
+        # fallback here -- ENTRYPOINT is now a SET (not a single value), and
+        # any fallback would relabel a cli/claude-vscode row as
+        # claude-desktop, exactly the mislabeling task 03's preserve-
+        # entrypoint fix exists to prevent.
+        "entrypoint": terminal_row.get("entrypoint"),
         "query_source": "subagent" if is_sidechain else "main",
         "user_email": identity.get("user_email", ""),
         "user_id": identity.get("user_id", ""),
@@ -481,11 +551,30 @@ def _record_retry_key(file_key: str, request_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Candidate building -- one pass over every transcript file. Resolves
 # (marks done, without shipping) whatever can be resolved with no network
-# call: non-desktop groups, groups predating the install watermark, and
-# groups with an unparseable ts. Everything else either ships this run
-# (non-trailing groups, and trailing groups that are complete/idle) or is
-# withheld (an in-flight trailing group).
+# call: groups with an entrypoint outside ENTRYPOINT (or missing/empty/
+# non-string), groups predating the install watermark, and groups with an
+# unparseable ts -- all permanently unshippable. Everything else either ships
+# this run (non-trailing, non-quarantined groups, and trailing groups that
+# are complete/idle) or is WITHHELD -- a temporary state that leaves
+# `examined_mtime` unadvanced and skips `_mark_resolved`, so the group stays
+# eligible on a later run: an in-flight trailing group (any entrypoint), or a
+# cli/claude-vscode group younger than BACKFILL_MIN_AGE_SECONDS.
 # ---------------------------------------------------------------------------
+
+
+def _within_backfill_quarantine_window(ts_epoch: float, now_epoch: float) -> bool:
+    """True if a cli/claude-vscode record's terminal-row timestamp is not
+    yet BACKFILL_MIN_AGE_SECONDS old.
+
+    Takes `now_epoch` as a parameter and never calls `datetime.now()` /
+    `time.time()` itself -- `run()` already threads a single `now` through
+    to `now_epoch`, so a test (or a future caller) can freeze/advance the
+    clock across two `run()` calls and this comparison responds exactly as
+    a real clock tick would, with no inline clock read at the comparison
+    site to work around.
+    """
+    return (now_epoch - ts_epoch) < BACKFILL_MIN_AGE_SECONDS
+
 
 def _build_candidates(files: list[Path], *, state: dict, install_epoch: float,
                        transcript_path_hint: str | None, hook_event_name: str | None,
@@ -534,7 +623,11 @@ def _build_candidates(files: list[Path], *, state: dict, install_epoch: float,
             entrypoint = terminal.get("entrypoint")
             ts_epoch = _parse_ts(terminal.get("timestamp"))
 
-            if entrypoint != ENTRYPOINT:
+            if not isinstance(entrypoint, str) or entrypoint not in ENTRYPOINT:
+                # Missing, empty, non-string, or outside the allowed set
+                # (e.g. "claude-web") -- permanently unshippable either way,
+                # so mark resolved now rather than re-parsing this row on
+                # every future run forever.
                 _mark_resolved(state, file_key, request_id)
                 continue
             if ts_epoch is None:
@@ -542,6 +635,20 @@ def _build_candidates(files: list[Path], *, state: dict, install_epoch: float,
                 continue
             if ts_epoch < install_epoch:
                 _mark_resolved(state, file_key, request_id)  # forward-only watermark
+                continue
+
+            if entrypoint != DESKTOP_ENTRYPOINT and _within_backfill_quarantine_window(
+                    ts_epoch, now_epoch):
+                # cli/claude-vscode record younger than BACKFILL_MIN_AGE_SECONDS
+                # -- the receiver's own OTLP-backfill exclusion check for this
+                # session may not be meaningful yet (the exporter's shutdown
+                # flush races this hook). WITHHELD, reusing the exact same
+                # mechanism as the trailing-group idle withhold below:
+                # examined_mtime does not advance and _mark_resolved is not
+                # called, so the group stays eligible on a later run instead
+                # of being skipped once and never revisited. claude-desktop
+                # is exempt -- see DESKTOP_ENTRYPOINT.
+                withheld = True
                 continue
 
             is_trailing = key == trailing_key
@@ -646,6 +753,39 @@ def run(*, projects_root: Path, state_path: Path, claude_json_path: Path,
     state.setdefault("drops", [])
     if "install_ts" not in state:
         state["install_ts"] = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    # --- one-time historical replay (Part C) ---------------------------
+    # Gated on a single flag: while it is absent, this is the first run of
+    # this hook version on this machine. Perform the two-part reset -- clear
+    # every file's `resolved` list and clear every `examined_mtime` (NOT
+    # optional: :509-511's mtime-unchanged short-circuit fires before
+    # `resolved` is ever consulted, so skipping this makes the whole replay
+    # a no-op against any file whose mtime hasn't changed since it was last
+    # examined -- true of every historical transcript, since history is not
+    # being appended to). This happens entirely in-memory here; it is
+    # written to disk (atomically, together with the flag) below, BEFORE the
+    # first POST of this pass, so a crash mid-replay cannot cause a second
+    # replay -- see the write further down.
+    #
+    # Deliberately does NOT reset `install_ts`/`install_epoch` below. This
+    # was tried and removed: `install_ts` is set to the real install time on
+    # a machine's first-ever run, so every transcript written AFTER
+    # installation already passes the :543-545 forward-only watermark check
+    # on its own -- `resolved`/`examined_mtime` were what actually blocked
+    # recovery, not the watermark. Resetting the watermark would have added
+    # nothing to this goal's target (post-install sessions whose OTLP export
+    # never flushed) and would instead have made PRE-installation history
+    # shippable too, for claude-desktop as well as CLI -- usage that was
+    # never captured by OTLP either, because the tool wasn't installed yet,
+    # so billing it now would expand a client's invoices retroactively
+    # rather than recover lost telemetry. Do not "fix" this by
+    # reintroducing a watermark reset here.
+    is_replay = "cli_backfill_replay_at" not in state
+    if is_replay:
+        for entry in state["files"].values():
+            entry["resolved"] = []
+            entry["examined_mtime"] = None
+
     install_epoch = _parse_ts(state["install_ts"]) or 0.0
 
     files = find_transcript_files(projects_root)
@@ -657,6 +797,20 @@ def run(*, projects_root: Path, state_path: Path, claude_json_path: Path,
             f"likely means the projects root is wrong (e.g. CLAUDE_CONFIG_DIR "
             f"mismatch), not that there is no usage.",
         )
+        if is_replay:
+            state["cli_backfill_replay_intended"] = {
+                "files_eligible": 0, "groups_eligible": 0, "records_to_ship": 0,
+            }
+            _append_log(
+                log_path,
+                f"{now.isoformat()} INFO cli-backfill replay: 0 files eligible, "
+                f"0 groups eligible, 0 records to ship (no transcript files found)",
+            )
+            state["cli_backfill_replay_at"] = now.isoformat()
+        state["cli_backfill_last_run"] = {
+            "shipped": 0, "rejected_by_reason": {}, "deferred": 0,
+            "replay_performed": is_replay,
+        }
         _save_state(state_path, state)
         return
 
@@ -680,6 +834,42 @@ def run(*, projects_root: Path, state_path: Path, claude_json_path: Path,
 
     pending_by_file = {fk: set(v["pending"]) for fk, v in file_meta.items()}
 
+    if is_replay:
+        # Log and persist the intended volume BEFORE the first POST of this
+        # pass -- a replay that intends to ship zero records is then visible
+        # immediately, at the moment it happens, and `state` (not stdout,
+        # which nobody reads on a laptop) is what will actually be inspected
+        # after the fact. One record ships per eligible group in this hook,
+        # so groups_eligible and records_to_ship are numerically equal here,
+        # but are reported separately since they answer different questions
+        # (scope of the replay vs. what it will actually send).
+        intended_volume = {
+            "files_eligible": len(files),
+            "groups_eligible": len(candidates),
+            "records_to_ship": len(candidates),
+        }
+        state["cli_backfill_replay_intended"] = intended_volume
+        _append_log(
+            log_path,
+            f"{now.isoformat()} INFO cli-backfill replay: "
+            f"{intended_volume['files_eligible']} files eligible, "
+            f"{intended_volume['groups_eligible']} groups eligible, "
+            f"{intended_volume['records_to_ship']} records to ship",
+        )
+        # Write the flag now, atomically together with the resets already
+        # made above (still in-memory until this save) and the intended-
+        # volume numbers -- BEFORE the loop below issues its first POST.
+        # This is what makes a crash mid-replay safe: the flag survives so a
+        # later run does not replay a second time, and the resets survive
+        # (this write is never rolled back) so whatever this run doesn't
+        # finish shipping still ships on that later, ordinary run.
+        state["cli_backfill_replay_at"] = now.isoformat()
+        _save_state(state_path, state)
+
+    shipped_count = 0    # records the server ACCEPTED -- not merely resolved
+    deferred_count = 0   # too_recent: left pending, retried on a later run
+    rejected_by_reason: dict[str, int] = {}
+
     idx = 0
     stop_due_to_transport = False
     while idx < len(candidates) and not stop_due_to_transport:
@@ -689,12 +879,41 @@ def run(*, projects_root: Path, state_path: Path, claude_json_path: Path,
         outcome, status, body = post_batch(records)
 
         if outcome == "ok":
+            rejections = body.get("rejections") or []
+            # `too_recent` is the ONE per-record rejection reason that is
+            # NOT permanent -- it means the receiver's own quarantine
+            # (BACKFILL_MIN_AGE_SECONDS server-side) still finds this record
+            # too young, most likely clock skew or latency between
+            # candidate-building here and the POST landing. Every other
+            # reason (session_has_otlp, invalid_entrypoint, etc.) is a
+            # permanent verdict and stays resolving, exactly as today.
+            # Getting this backwards would let resolve-on-200 (below) burn a
+            # too_recent record forever on its very first attempt.
+            rejected_ids = {
+                r.get("request_id") for r in rejections if isinstance(r, dict)
+            }
+            too_recent_ids = {
+                r.get("request_id") for r in rejections
+                if isinstance(r, dict) and r.get("reason") == "too_recent"
+            }
             for _record, file_key, request_id, _ts in chunk:
+                if request_id in too_recent_ids:
+                    deferred_count += 1
+                    continue  # non-resolving -- stays pending for a later run
                 _mark_resolved(state, file_key, request_id)
                 pending_by_file[file_key].discard(request_id)
                 state["envelope_retries"].pop(_record_retry_key(file_key, request_id), None)
-            rejections = body.get("rejections") or []
+                # Resolution and counting are separate concerns: a permanently
+                # rejected record is resolved (never retried) but was NOT
+                # accepted, so it must not count as shipped. Otherwise a
+                # replay that recovers nothing would report recovery.
+                if request_id not in rejected_ids:
+                    shipped_count += 1
             if rejections:
+                for r in rejections:
+                    if isinstance(r, dict):
+                        reason = r.get("reason") or "unknown"
+                        rejected_by_reason[reason] = rejected_by_reason.get(reason, 0) + 1
                 state["drops"].append({
                     "ts": now.isoformat(),
                     "kind": "rejected_200",
@@ -742,6 +961,26 @@ def run(*, projects_root: Path, state_path: Path, claude_json_path: Path,
             continue
         state["files"].setdefault(file_key, {"resolved": [], "examined_mtime": None})
         state["files"][file_key]["examined_mtime"] = meta["mtime"]
+
+    # Recovery must be measurable (Part C): persisted into `state`, not only
+    # ever visible via the injected post_batch's own call log, so the
+    # outcome is inspectable after the fact on a real machine. The tallies
+    # reconcile against the pre-POST intended volume for a run that reached
+    # every batch:
+    #   records_to_ship == shipped + sum(rejected_by_reason.values())
+    #   deferred        == rejected_by_reason.get("too_recent", 0)
+    # `rejected_by_reason` lists EVERY server rejection including too_recent
+    # (Part C: the breakdown must show it); `deferred` calls out the
+    # retryable subset separately so "permanently rejected" and "still
+    # pending" are not read as the same thing. A transport_fail stops the
+    # run early, so the remainder is simply absent from all tallies and
+    # ships on a later run.
+    state["cli_backfill_last_run"] = {
+        "shipped": shipped_count,
+        "rejected_by_reason": rejected_by_reason,
+        "deferred": deferred_count,
+        "replay_performed": is_replay,
+    }
 
     _save_state(state_path, state)
 

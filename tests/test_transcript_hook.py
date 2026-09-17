@@ -106,7 +106,17 @@ def _soon():
 # AC1 / AC1b / AC1c: entrypoint filter + terminal-block collapse
 # ---------------------------------------------------------------------------
 
-def test_ac1_only_desktop_entrypoint_ships(hook, entrypoint_mix_transcript):
+def test_ac1_desktop_and_cli_entrypoints_ship_claude_vscode_withheld_trailing(
+    hook, entrypoint_mix_transcript
+):
+    """Inverted for otel-export-loss-reduction task 04 Part A: the hook now
+    ships `cli`/`claude-vscode` too, not only `claude-desktop`. Under correct
+    behavior 2 of the fixture's 3 rows ship here -- the third
+    (claude-vscode, the file's LAST-appearing group) is still withheld by the
+    pre-existing 30s trailing-group rule (unrelated to entrypoint), since
+    `hook_event_name`/`transcript_path_hint` are None here and the file's
+    real mtime is not >30s stale relative to `_now()`.
+    """
     _seed_epoch_install(entrypoint_mix_transcript.parent / "state.json")
     post = _capturing_post()
     hook.run(
@@ -117,9 +127,32 @@ def test_ac1_only_desktop_entrypoint_ships(hook, entrypoint_mix_transcript):
         now=_now(), post_batch=post,
     )
     shipped = [r for chunk in post.calls for r in chunk]
-    assert len(shipped) == 1
-    assert shipped[0]["entrypoint"] == "claude-desktop"
-    assert shipped[0]["session_id"] == "sess-claude-desktop"
+    assert len(shipped) == 2
+    assert {r["entrypoint"] for r in shipped} == {"claude-desktop", "cli"}
+    assert "sess-claude-vscode" not in {r["session_id"] for r in shipped}
+
+
+def test_ac1_out_of_set_entrypoint_never_ships(hook, tmp_path):
+    """Kept alive: an entrypoint genuinely outside the allowed set must still
+    never ship, regardless of the cli/claude-vscode widening above."""
+    root = tmp_path / "claude_projects" / "proj"
+    root.mkdir(parents=True)
+    row = _usage_row(
+        session_id="sess-web", request_id="req-web", message_id="msg-web",
+        api_block_index=0, stop_reason="end_turn", input_tokens=1, output_tokens=1,
+        cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        entrypoint="claude-web", timestamp="2026-01-01T00:00:00Z",
+    )
+    (root / "sess-web.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    state_path = tmp_path / "state.json"
+    _seed_epoch_install(state_path)
+    post = _capturing_post()
+    hook.run(
+        projects_root=root.parent, state_path=state_path,
+        claude_json_path=tmp_path / "missing.claude.json",
+        transcript_path_hint=None, hook_event_name=None, now=_now(), post_batch=post,
+    )
+    assert [r for chunk in post.calls for r in chunk] == []
 
 
 def test_build_payload_record_carries_entrypoint_not_stamps_it(hook):
@@ -487,6 +520,11 @@ def test_ac5_malformed_trailing_line_skipped_preceding_records_ship(hook, projec
 # ---------------------------------------------------------------------------
 
 def test_ac6_running_twice_ships_each_record_once(hook, entrypoint_mix_transcript):
+    """Inverted for otel-export-loss-reduction task 04 Part A, same fixture
+    and root cause as test_ac1 above: 2 of the 3 rows ship (claude-desktop +
+    cli; claude-vscode stays withheld as the trailing group both runs), and
+    running the hook twice must not ship either of those two more than
+    once."""
     state_path = entrypoint_mix_transcript.parent / "state.json"
     _seed_epoch_install(state_path)
     post = _capturing_post()
@@ -498,7 +536,10 @@ def test_ac6_running_twice_ships_each_record_once(hook, entrypoint_mix_transcrip
     hook.run(now=_now(), post_batch=post, **kwargs)
     hook.run(now=_now(), post_batch=post, **kwargs)
     shipped = [r for chunk in post.calls for r in chunk]
-    assert len(shipped) == 1
+    assert len(shipped) == 2
+    assert {r["entrypoint"] for r in shipped} == {"claude-desktop", "cli"}
+    request_ids = [r["request_id"] for r in shipped]
+    assert len(request_ids) == len(set(request_ids))  # no record shipped twice
 
 
 # ---------------------------------------------------------------------------
