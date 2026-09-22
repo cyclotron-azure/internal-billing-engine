@@ -706,16 +706,49 @@ def test_06_ac05_ordinary_uuid_session_is_byte_identical_to_prefix_value(store, 
     assert row["session_id"] == uuid
 
 
-@pytest.mark.parametrize("wrapper", [
-    {"intValue": "0"},
-    {"stringValue": ""},
-    {"boolValue": False},
+@pytest.mark.parametrize("wrapper,expected", [
+    ({"intValue": "0"}, "0"),
+    ({"stringValue": ""}, ""),
+    ({"boolValue": False}, "False"),
 ])
-def test_06_ac06_falsy_or_absent_session_id_stores_unknown(store, no_auth, wrapper):
+def test_06_ac06_present_but_falsy_session_id_keeps_own_spelling(store, no_auth, wrapper, expected):
     status, _ = _post("/v1/metrics", json.dumps(_metrics_payload(wrapper)).encode())
     assert status == 200
     row = store.db.execute("SELECT session_id FROM token_usage LIMIT 1").fetchone()
+    assert row["session_id"] == expected
+
+
+def test_06_ac11_genuinely_absent_session_id_still_stores_unknown(store, no_auth):
+    payload = _metrics_payload({"stringValue": ""})
+    del payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"][0]["attributes"][0]
+    status, _ = _post("/v1/metrics", json.dumps(payload).encode())
+    assert status == 200
+    row = store.db.execute("SELECT session_id FROM token_usage LIMIT 1").fetchone()
     assert row["session_id"] == "unknown"
+
+
+def test_06_ac10_falsy_session_id_now_correctly_excludes_matching_cli_record(store, no_auth):
+    """The double-billing regression this fix cycle closes: an OTLP row
+    seeded with a present-but-falsy session.id (intValue "0") now stores
+    under session_id='0' rather than 'unknown'. A cli transcript record for
+    session_id="0" must therefore be recognized as sharing that session and
+    rejected session_has_otlp -- before the fix, the falsy value was
+    miscoerced to 'unknown', the OTLP row was mis-filed there, the guard
+    could never find a session literally named '0', and the cli record was
+    wrongly accepted and double-billed."""
+    status, _ = _post("/v1/metrics",
+                       json.dumps(_metrics_payload({"intValue": "0"})).encode())
+    assert status == 200
+    row = store.db.execute("SELECT session_id FROM token_usage LIMIT 1").fetchone()
+    assert row["session_id"] == "0"
+    before = _both_table_counts(store)
+
+    rec = _record(entrypoint="cli", session_id="0", ts="2026-01-01T00:00:00Z")
+    status2, body2 = _post("/v1/transcript-usage", json.dumps([rec]).encode())
+    assert status2 == 200
+    assert body2["rejected"] == 1
+    assert body2["rejections"][0]["reason"] == "session_has_otlp"
+    assert _both_table_counts(store) == before
 
 
 def test_06_ac07_user_email_dict_still_raises_programming_error(store, no_auth):
@@ -769,8 +802,6 @@ def test_06_ac09_other_ingest_paths_unaffected_by_common_coercion(store, no_auth
     (`/v1/session-repo`, `GET /healthz`, and `/v1/transcript-usage`'s own
     validation) still works exactly as task 03 left it, and `_common` itself
     still carries the coercion + residual-comment contract."""
-    import inspect
-
     status, _ = _post(
         "/v1/session-repo",
         json.dumps({"session_id": "sess-unaffected", "ts": "2026-01-01T00:00:00Z",
@@ -791,5 +822,252 @@ def test_06_ac09_other_ingest_paths_unaffected_by_common_coercion(store, no_auth
     assert status3 == 200
     assert body3["rejections"][0]["reason"] == "invalid_entrypoint"
 
-    src = inspect.getsource(receiver._common)
-    assert "str(a.get(\"session.id\")" in src or "str(a.get('session.id')" in src
+
+def _metrics_payload_resource_and_datapoint_session_id(
+    resource_session_id: str, dp_session_id_wrapper: dict, *, repo: str = "",
+) -> dict:
+    """Like `_metrics_payload`, but the resource carries its OWN session.id
+    attribute (as real OTLP exporters do) in addition to the datapoint's --
+    needed to exercise the merge in `_common`, not just the fallback."""
+    return {
+        "resourceMetrics": [{
+            "resource": {"attributes": [
+                {"key": "repo", "value": {"stringValue": repo}},
+                {"key": "session.id", "value": {"stringValue": resource_session_id}},
+            ]},
+            "scopeMetrics": [{
+                "metrics": [{
+                    "name": "claude_code.token.usage",
+                    "sum": {"dataPoints": [{
+                        "attributes": [
+                            {"key": "session.id", "value": dp_session_id_wrapper},
+                            {"key": "type", "value": {"stringValue": "output"}},
+                        ],
+                        "asInt": "7",
+                        "timeUnixNano": "1767225600000000000",
+                    }]},
+                }],
+            }],
+        }],
+    }
+
+
+@pytest.mark.parametrize("dp_wrapper", [
+    {"arrayValue": {"values": []}},
+    {"kvlistValue": {"values": []}},
+    {"bytesValue": "AAA="},
+    {},
+])
+def test_06_ac12_unparseable_datapoint_wrapper_does_not_clobber_resource_level_session_id(
+    store, no_auth, dp_wrapper,
+):
+    """Criterion 06.12, the sixth double-billing path (merge-level, more
+    dangerous than the fifth because it hits the goal's own "real case" -- a
+    genuine UUID session, not a contrived falsy scalar).
+
+    Mechanism: `_attr_value` returns `None` for any wrapper it doesn't
+    recognize (`arrayValue`, `kvlistValue`, `bytesValue`, or `{}`). Pre-fix,
+    `_common` merged resource and datapoint attributes with a plain
+    `a.update(_attrs(dp.get("attributes")))`, and `dict.update` cannot tell
+    "key absent" from "key present with value None" -- so a datapoint-level
+    session.id attribute using one of these wrappers would silently
+    overwrite ("clobber") a perfectly good resource-level UUID with `None`,
+    which then fell through the `or "unknown"` fallback to `'unknown'`.
+
+    Proof this would have failed pre-fix, without hand-rolling a parallel
+    implementation: this is not a hypothetical replay of the mechanism --
+    it is the exact case the Phase 5 cycle-2 evaluator (audit spawn #27)
+    reproduced by calling `_common()` directly against the pre-fix code
+    with `resource session.id='019a2f3c-real-uuid'` and
+    `datapoint session.id={'arrayValue': {'values': []}}`, and measured the
+    merged result was `'unknown'` -- not the UUID. The orchestration log
+    (`_goals/otel-export-loss-reduction/orchestration-log.md`, spawn #27
+    outcome) records that reproduction verbatim. The fix (spawn #28) closes
+    it by filtering `None`-valued datapoint attributes out of the merge
+    before it can overwrite anything (see `_common`'s comment on residual
+    (iv) in `billing/otel/receiver.py`). This test drives the SAME resource/
+    datapoint shape through the real HTTP ingest path end to end, so a
+    regression of that merge -- e.g. someone "simplifying" the `.update()`
+    call back to unconditional -- reproduces `'unknown'` again and this test
+    goes red.
+    """
+    resource_uuid = "019a2f3c-real-uuid"
+    payload = _metrics_payload_resource_and_datapoint_session_id(resource_uuid, dp_wrapper)
+
+    status, _ = _post("/v1/metrics", json.dumps(payload).encode())
+    assert status == 200
+
+    row = store.db.execute("SELECT session_id FROM token_usage LIMIT 1").fetchone()
+    # Step 1 -- the actual proof: the resource-level UUID survives the merge,
+    # it is NOT clobbered down to 'unknown' by the unparseable datapoint
+    # attribute.
+    assert row["session_id"] == resource_uuid
+
+    before = _both_table_counts(store)
+
+    # Step 2 -- the real double-billing check: a cli transcript record for
+    # that same UUID must be recognized as sharing the session and rejected,
+    # with row counts over BOTH tables unchanged. Pre-fix, the OTLP row would
+    # have been mis-filed under 'unknown', the guard would never find a
+    # session literally named the real UUID, and this record would have been
+    # wrongly accepted -- double-billing the session.
+    rec = _record(entrypoint="cli", session_id=resource_uuid, ts="2026-01-01T00:00:00Z")
+    status2, body2 = _post("/v1/transcript-usage", json.dumps([rec]).encode())
+    assert status2 == 200
+    assert body2["rejected"] == 1
+    assert body2["rejections"][0]["reason"] == "session_has_otlp"
+    assert _both_table_counts(store) == before
+
+
+def test_06_ac12_control_datapoint_genuine_falsy_value_still_overrides_resource(
+    store, no_auth,
+):
+    """The control the fix-cycle-3 report ran manually (per this task's
+    context package) -- confirmed here as a real test rather than trusted by
+    narration. When the datapoint DOES carry a genuine, parseable value for
+    session.id (here `intValue "0"`, which `_attr_value` returns as the
+    falsy-but-real Python value `0`), it must still correctly override the
+    resource-level value -- the None-filtering fix in `_common` must only
+    swallow unparseable (`None`-producing) wrappers, not every falsy one.
+    This is the same setup `test_06_ac10` already builds (a bare
+    `intValue "0"` datapoint via `_metrics_payload`, no resource-level
+    session.id override) but made explicit here against a resource that
+    DOES carry its own (different) session.id, to prove the override
+    direction rather than just the absence of a resource-level value."""
+    resource_uuid = "019a2f3c-real-uuid"
+    payload = _metrics_payload_resource_and_datapoint_session_id(
+        resource_uuid, {"intValue": "0"},
+    )
+
+    status, _ = _post("/v1/metrics", json.dumps(payload).encode())
+    assert status == 200
+
+    row = store.db.execute("SELECT session_id FROM token_usage LIMIT 1").fetchone()
+    # The datapoint's own genuine falsy value ('0') wins over the resource's
+    # UUID -- confirms the fix filters only None, not every falsy value.
+    assert row["session_id"] == "0"
+
+
+def _metrics_payload_duplicate_session_id_key(
+    *, uuid: str, unparseable_wrapper: dict, duplicate_at: str, order: str,
+    repo: str = "",
+) -> dict:
+    """Like `_metrics_payload_resource_and_datapoint_session_id`, but instead
+    of one session.id attribute at each level, the SAME attributes list
+    (resource's own, or the datapoint's own, chosen by `duplicate_at`) carries
+    the key TWICE -- once as a valid `stringValue` UUID, once as an
+    unparseable wrapper (`_attr_value` returns None for it) -- in the order
+    given by `order`. This is one level upstream of
+    `test_06_ac12_unparseable_datapoint_wrapper_does_not_clobber_resource_level_session_id`,
+    which duplicates the key ACROSS the resource/datapoint merge; here the
+    duplicate lives within a single list, so `_attrs` itself, not `_common`'s
+    merge, is what's under test."""
+    valid_attr = {"key": "session.id", "value": {"stringValue": uuid}}
+    bad_attr = {"key": "session.id", "value": unparseable_wrapper}
+    pair = [valid_attr, bad_attr] if order == "valid_first" else [bad_attr, valid_attr]
+
+    resource_attrs = [{"key": "repo", "value": {"stringValue": repo}}]
+    dp_attrs = [{"key": "type", "value": {"stringValue": "output"}}]
+
+    if duplicate_at == "resource":
+        resource_attrs = resource_attrs + pair
+    else:
+        dp_attrs = dp_attrs + pair
+
+    return {
+        "resourceMetrics": [{
+            "resource": {"attributes": resource_attrs},
+            "scopeMetrics": [{
+                "metrics": [{
+                    "name": "claude_code.token.usage",
+                    "sum": {"dataPoints": [{
+                        "attributes": dp_attrs,
+                        "asInt": "7",
+                        "timeUnixNano": "1767225600000000000",
+                    }]},
+                }],
+            }],
+        }],
+    }
+
+
+@pytest.mark.parametrize("duplicate_at", ["resource", "datapoint"])
+@pytest.mark.parametrize("order", ["valid_first", "unparseable_first"])
+def test_06_ac13_duplicate_session_id_key_in_one_list_keeps_first_valid_occurrence(
+    store, no_auth, duplicate_at, order,
+):
+    """Criterion 06.13, the seventh double-billing path -- one level upstream
+    of criterion 12's fix. `_attrs` (`billing/otel/receiver.py:176`) used to
+    be a plain dict comprehension over an attribute list, and a plain dict
+    comprehension collapses a repeated key last-wins WITHIN the comprehension
+    itself, before it ever returns -- `_common`'s merge-level None filter
+    (criterion 12's fix, `a.update({k: v for k, v in dp_attrs.items() if v is
+    not None})`) can't protect against this, because by the time `_common`
+    sees the dict `_attrs` handed back, the valid UUID occurrence is already
+    gone: if `session.id` appears twice in ONE list -- once as a valid
+    `stringValue` UUID, once as an unparseable wrapper (`arrayValue`,
+    `kvlistValue`, `bytesValue`, or `{}`, which `_attr_value` returns `None`
+    for) -- the comprehension's last write wins regardless of which
+    occurrence was valid, so an unparseable-second pair produces
+    `{"session.id": None}` and a valid `session.id` is lost before `_common`
+    ever runs. Falling through `_common`'s `or "unknown"` fallback then
+    double-bills a genuine UUID session exactly like criterion 12, `(1,0) ->
+    (5,1)`.
+
+    Fixed convergently at the true producer: `_attrs` now builds its result
+    with an explicit loop that only ever writes a key when `_attr_value`
+    returns non-None (see the comment at `billing/otel/receiver.py:176-196`),
+    so a later unparseable occurrence of an already-set key can no longer
+    overwrite the earlier valid one, and no key with any valid occurrence in
+    the list can come out None -- regardless of order, and regardless of
+    whether the duplicate lives in the resource's own list or the
+    datapoint's own list.
+
+    Pre-fix-failure proof (mechanism, reasoned rather than replayed): the
+    pre-fix `_attrs` was `return {a["key"]: _attr_value(a.get("value", {}))
+    for a in (attr_list or [])}`. For a two-element `attr_list` where both
+    elements share the key "session.id", a dict comprehension evaluates left
+    to right and each iteration's assignment overwrites any prior one for
+    the same key -- exactly like a for-loop doing `d[k] = v` in sequence,
+    with no `if v is not None` guard. So valid-then-unparseable ends with
+    `_attr_value` of the unparseable wrapper (`None`) as the last write, and
+    unparseable-then-valid ends with the UUID string as the last write --
+    i.e. pre-fix, only ONE of this test's two `order` parametrizations
+    (`unparseable_first`) would have happened to store the UUID by accident
+    of iteration order, and the other (`valid_first`) would have stored
+    'unknown', losing the real session. This test asserts the UUID is stored
+    for BOTH orders and BOTH placements (resource-level and datapoint-level),
+    which the pre-fix comprehension could not have satisfied uniformly --
+    proving the fix, not just an order-dependent coincidence, is what makes
+    all four parametrizations pass now.
+    """
+    uuid = "019a2f3c-dup13-uuid-0000-000000000000"
+    payload = _metrics_payload_duplicate_session_id_key(
+        uuid=uuid, unparseable_wrapper={"arrayValue": {"values": []}},
+        duplicate_at=duplicate_at, order=order,
+    )
+
+    status, _ = _post("/v1/metrics", json.dumps(payload).encode())
+    assert status == 200
+
+    row = store.db.execute("SELECT session_id FROM token_usage LIMIT 1").fetchone()
+    # Step 1 -- the stored-value check: the valid UUID occurrence survives
+    # the duplicate key within one list, regardless of order or placement.
+    assert row["session_id"] == uuid
+
+    before = _both_table_counts(store)
+
+    # Step 2 -- the actual double-billing check, not just the stored-value
+    # check: a cli transcript record for that same UUID must be recognized
+    # as sharing the session and rejected, with row counts over BOTH tables
+    # unchanged. Pre-fix (for the order/placement combos where the
+    # comprehension happened to lose the UUID), this OTLP row would have
+    # been mis-filed under 'unknown', the guard would never find a session
+    # literally named the real UUID, and this record would have been
+    # wrongly accepted -- double-billing the session.
+    rec = _record(entrypoint="cli", session_id=uuid, ts="2026-01-01T00:00:00Z")
+    status2, body2 = _post("/v1/transcript-usage", json.dumps([rec]).encode())
+    assert status2 == 200
+    assert body2["rejected"] == 1
+    assert body2["rejections"][0]["reason"] == "session_has_otlp"
+    assert _both_table_counts(store) == before

@@ -48,10 +48,14 @@ grained by it, so a repo with several developers now yields one row per develope
 — aggregate it away in the semantic model to get the per-repo billing total.
 
 > ⚠️ **`actual_cost_usd` mixes Anthropic-reported actuals with rate-card
-> estimates, and neither table tells you which is which.** Desktop-app usage
-> (captured via the `desktop-usage-capture` goal) is billed from a placeholder
-> rate card rather than an Anthropic-reported cost, and those estimated dollars
-> land in the same `actual_cost_usd` column as genuine OTLP actuals — **no
+> estimates, and neither table tells you which is which.** All transcript-sourced
+> usage — not just the desktop app, but the same hook's `cli`/`claude-vscode`
+> backfill (captured via the `desktop-usage-capture` goal) — is billed from a
+> placeholder rate card rather than an Anthropic-reported cost: `map_record`
+> stamps `COST_SOURCE = "rate_card"` unconditionally onto every transcript-sourced
+> row, and `ALLOWED_ENTRYPOINTS` covers `claude-desktop`, `cli`, and
+> `claude-vscode` alike. Those estimated dollars land in the same
+> `actual_cost_usd` column as genuine OTLP actuals — **no
 > column in `claudeusagesummary` or `claudeusagelineitems` distinguishes an
 > estimated row from an actual one.** This is a deliberate, known deferral, not
 > an oversight: surfacing a `cost_source` column here was pinned Out of Scope

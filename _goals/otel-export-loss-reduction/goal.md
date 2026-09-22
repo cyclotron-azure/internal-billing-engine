@@ -64,6 +64,14 @@ transcripts are sitting on disk and the desktop sweeper already reads them.
 
 - [ ] `OTEL_METRIC_EXPORT_INTERVAL` is `10000` in all four config sources, and no source
       still says `60000`. A fleet-wide grep for `60000` returns only historical prose.
+      **Amended after the goal closed.** `pilot-package/` (2 of the original 4 sources) was
+      deleted by user decision on 2026-09-21 -- it was already documented in `README.md` as
+      "superseded by `client-package/`", not a config-drift risk this goal needed to guard.
+      The live criterion is now: `10000` in both **surviving** sources
+      (`deploy/managed-settings.json`, `client-package/configure.py`), and no source
+      describing the current interval still says `60000`. The zips (`client-package.zip`)
+      are a separate, still-open finding from the Phase 5 audit -- not resolved by this
+      amendment.
 - [ ] `GET /healthz` answers without authentication and reports liveness only, so a
       stalled receiver is detectable by an unauthenticated prober. Freshness detail is
       served **only** when `RECEIVER_AUTH_TOKEN` is non-empty *and* the caller presents a

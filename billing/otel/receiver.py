@@ -174,7 +174,26 @@ def _attr_value(v: dict):
 
 
 def _attrs(attr_list) -> dict:
-    return {a["key"]: _attr_value(a.get("value", {})) for a in (attr_list or [])}
+    # Drop a key entirely when its parsed value is None, rather than ever
+    # storing None for it. A plain dict comprehension (the prior form) makes
+    # duplicate keys within one list collapse last-wins -- if `session.id`
+    # (or any key) appears twice in the same list and the second occurrence
+    # uses a wrapper `_attr_value` can't parse (arrayValue, kvlistValue,
+    # bytesValue, {}), the earlier, valid occurrence would be overwritten by
+    # a None before this function ever returns, closing off the entire
+    # attribute for that datapoint/resource -- no downstream consumer, no
+    # matter how careful, can protect a value that's already gone by the
+    # time it sees the dict. Producing without ever emitting None fixes that
+    # at its source: the returned dict is now structurally guaranteed to
+    # never contain a None value for any key, at either the resource or the
+    # datapoint level, regardless of key ordering or duplicates within the
+    # list.
+    result = {}
+    for a in (attr_list or []):
+        v = _attr_value(a.get("value", {}))
+        if v is not None:
+            result[a["key"]] = v
+    return result
 
 
 def _datapoints(metric: dict) -> list:
@@ -184,8 +203,25 @@ def _datapoints(metric: dict) -> list:
 def _common(res: dict, dp: dict) -> dict:
     """Merge resource + datapoint attributes and pull the fields we store."""
     a = dict(res)
-    a.update(_attrs(dp.get("attributes")))  # datapoint attrs win
+    dp_attrs = _attrs(dp.get("attributes"))
+    a.update({k: v for k, v in dp_attrs.items() if v is not None})  # datapoint attrs
+    # win, but never with a None -- `_attr_value` used to be reachable through
+    # `_attrs` for any wrapper it can't parse (arrayValue, kvlistValue,
+    # bytesValue, {}), and plain dict.update doesn't distinguish "key absent"
+    # from "key present with value None," so an unparseable datapoint-level
+    # attribute would otherwise clobber a perfectly valid resource-level value
+    # for the same key. Filtering here is deliberately general -- it protects
+    # every merged field (session.id, user.email, model, repo, ...), not just
+    # session_id -- but it is NOT "the one place to fix it": `_attrs` itself
+    # was later found to leak a None through an unrelated path (duplicate keys
+    # within one attribute list collapsing last-wins), which this filter can't
+    # help with because the value is already gone before `_common` ever runs.
+    # That was fixed at `_attrs`, which now never returns None for any key --
+    # making this filter dead code today, kept deliberately as defense-in-depth
+    # against a future change to `_attrs` reintroducing a None leak, not
+    # because it currently filters anything out. See residual (v) below.
     repo_raw = a.get("repo")
+    _raw_session_id = a.get("session.id")
     return {
         # Coerce to str after the "unknown" fallback so SQLite's TEXT-affinity
         # conversion is never the thing that decides the stored spelling —
@@ -215,10 +251,71 @@ def _common(res: dict, dp: dict) -> dict:
         #     even a defect: if the producer sent the number 42.0, '42.0' is the
         #     faithful spelling, and a transcript record claiming '42' for the same
         #     session is asserting a different id, not a matching one.
-        # This fix is therefore partial by design, not by oversight: it does not
-        # close the normalization-asymmetry class, only the slice of it that this
-        # function's own str() can affect.
-        "session_id": str(a.get("session.id") or "unknown"),
+        # Residual (iii) -- Phase 5 final audit finding, fixed here: the `or
+        # "unknown"` form above conflated "attribute truly absent" with
+        # "attribute present but falsy". `_attr_value` can legitimately return
+        # 0, False, 0.0, or "" for a real (if degenerate) session.id, and `or`
+        # treated all of those as missing, collapsing them into the single
+        # shared key 'unknown' -- which then let a real session double-bill,
+        # because its OTLP row was mis-filed under 'unknown' and the guard
+        # could never find it there. Fix: distinguish None (genuinely absent,
+        # or `_attr_value` couldn't parse the wrapper) from every other falsy
+        # value via `_raw_session_id` computed once above; only None maps to
+        # "unknown" now, so 0/False/0.0/"" keep their own str() spelling. The
+        # genuinely-absent case is unaffected on purpose, not a residual left
+        # over by accident: multiple attribute-less datapoints still share
+        # 'unknown', which is the same accepted-residual class as the goal's
+        # other one (partially-lost sessions have no safe unit of comparison)
+        # -- inventing a unique placeholder per anonymous datapoint is a much
+        # larger change and stays out of scope here.
+        #
+        # This fix is class-adjacent to, but distinct from, residual (ii)
+        # above: it closes a None-vs-falsy bug, not one of the three SQLite-
+        # affinity survivors. Those three -- intValue "0123", intValue
+        # "+123", and doubleValue 42.0 -- are untouched by this change and
+        # remain open for the reasons already stated in residual (ii). This
+        # fix is still partial by design: it does not close the
+        # normalization-asymmetry class, only the None-vs-falsy slice of it.
+        #
+        # Residual (iv) -- also now closed, one level up from (iii): the
+        # merge above (`a.update(...)`) used to let a datapoint-level
+        # attribute with an unrecognized wrapper (`_attr_value` returns None
+        # for arrayValue/kvlistValue/bytesValue/{}) clobber a valid
+        # resource-level value for the same key, because plain dict.update
+        # can't tell "key absent" from "key present with value None." That
+        # clobbered None then looked, to the check just above, exactly like
+        # a genuinely-absent attribute -- so it stored 'unknown' even for a
+        # real UUID session. The merge now filters out None-valued datapoint
+        # attributes before updating, so this can no longer happen for
+        # session_id or any other field this function merges. What this
+        # proves: no `_attr_value`-unparseable datapoint-level wrapper can
+        # clobber a present resource-level value anymore. It does not prove
+        # the normalization-asymmetry class is now exhaustively closed --
+        # the three SQLite-affinity survivors in residual (ii) are untouched
+        # and still open.
+        #
+        # Residual (v) -- moved one level further upstream, to the true
+        # producer: `_attrs` was a plain dict comprehension, so duplicate
+        # keys within a single attribute list (resource or datapoint)
+        # collapsed last-wins. If session.id (or any key) appeared twice in
+        # one list and the second occurrence used an unparseable wrapper,
+        # `_attrs` handed back None for that key *before* this function's
+        # merge filter (residual iv) ever ran -- the filter can't protect a
+        # value that was never in the dict to begin with. `_attrs` now drops
+        # a key entirely instead of ever emitting None for it, which is the
+        # convergent fix: there is exactly one place values are produced
+        # versus many places they could be consumed, so fixing production
+        # closes this for every consumer, not just this function. What this
+        # proves: no key with at least one valid occurrence in an attribute
+        # list, at either level, can surface as None anymore, regardless of
+        # duplicates or ordering. It does NOT prove this file's handling of
+        # OTLP attributes is now exhaustively audited -- Phase 5 separately
+        # found an unrelated commit-atomicity issue in
+        # `ingest_metrics_payload`, spun off as its own follow-up task, and
+        # the residual (ii) SQLite-affinity survivors remain open regardless.
+        "session_id": (
+            str(_raw_session_id) if _raw_session_id is not None else "unknown"
+        ),
         "repo": normalize_remote(repo_raw),
         "repo_raw": repo_raw or "",
         "user_email": a.get("user.email") or "",

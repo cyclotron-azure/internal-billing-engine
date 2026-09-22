@@ -101,6 +101,23 @@ agreeing with the spelling `dp_key` has always hashed. This is a consistency rep
       sees it. Name that root cause explicitly so nobody reads this fix as complete.
       For (i): none are expected in production (UUIDs) and a backfill is deliberately out
       of scope, but the comment must say so rather than imply the fix is retroactive.
+- [ ] **Added after Phase 5 final audit — the fifth double-billing path.** The
+      `or "unknown"` fallback conflates "attribute truly absent" with "attribute present
+      but falsy". `_attr_value` can legitimately return `0`, `False`, `0.0` or `""` for a
+      real (if degenerate) `session.id` -- Python's `or` treats all of those as missing and
+      collapses them into the single shared key `'unknown'`. Measured: a `cli` transcript
+      record for session `'0'` is accepted even though an OTLP row for that same session
+      already exists, because the OTLP row was mis-filed under `'unknown'` and the guard
+      never finds it -- `(1,0) -> (3,1)`, double-billed. Fix: distinguish `None` (the
+      attribute is genuinely absent, or `_attr_value` couldn't parse it) from any other
+      falsy value. Only `None` maps to `"unknown"`; `0`, `False`, `0.0` and `""` keep their
+      own `str()` spelling. Compute the raw value once (`a.get("session.id")`) into a local
+      before the `return` dict, rather than calling `.get` twice inside the dict literal.
+      **The genuinely-absent case is unaffected and is not a defect**: multiple truly
+      attribute-less datapoints still share `'unknown'`, and that residual is the same
+      class as the goal's other accepted residual -- partially-lost sessions have no safe
+      unit of comparison. Do not try to give every anonymous datapoint a unique key; that
+      is a much larger change and out of scope here.
 - [ ] Standard library only.
 
 ## Acceptance Criteria
@@ -120,6 +137,8 @@ agreeing with the spelling `dp_key` has always hashed. This is a consistency rep
    | `intValue "0123"` | `'123'` | `'0123'` | **no** |
    | `intValue "+123"` | `'123'` | `'+123'` | **no** |
    | `doubleValue 42.0` | `'42.0'` | `'42'` | **no** |
+
+   **A fourth, unrelated-to-SQLite defect was found by the Phase 5 audit and closed in a follow-up fix cycle** -- see criterion 11.
 
    The three that remain have a **different root cause**, and they are not all the same
    root cause either:
@@ -175,6 +194,52 @@ agreeing with the spelling `dp_key` has always hashed. This is a consistency rep
    `_attrs`, `ingest_session_repo_payload`, `ingest_transcript_usage_payload` and the
    `/healthz` handler are byte-identical to their state at the end of task 03 —
    verification: command output
+10. **The None-vs-falsy fix, added after Phase 5.** For `intValue "0"`, `boolValue false`,
+    and `doubleValue 0.0`: the OTLP row stores `'0'`, `'False'`, `'0.0'` respectively (not
+    `'unknown'`). A `cli` transcript record posted for that same string id is then
+    correctly excluded (`session_has_otlp`), with `SELECT COUNT(*)` over both tables
+    unchanged. Drive real OTLP JSON payloads -- verification: integration test
+11. **The genuinely-absent case is unchanged.** An OTLP datapoint with no `session.id`
+    attribute at all still stores `'unknown'`, exactly as before. This is the assertion
+    that fails if someone "fixes" the residual by inventing a per-datapoint unique
+    placeholder -- verification: unit test
+
+12. **Added after Phase 5 cycle-2 audit -- the sixth double-billing path, merge-level.**
+    An OTLP resource carries a real UUID `session.id`; the same datapoint's own
+    `session.id` attribute uses an unrecognized wrapper (`arrayValue`, `kvlistValue`,
+    `bytesValue`, or an empty `{}`) -- `_attr_value` returns `None` for these. Before this
+    fix, `_common`'s `a.update(_attrs(...))` let that `None` clobber the valid
+    resource-level value (`dict.update` cannot distinguish "key absent" from "key present
+    with value None"), storing `'unknown'` for a session that had a perfectly good real
+    id -- more dangerous than criteria 10/11's falsy-scalar case because it hits the
+    goal's own "real case" (a genuine UUID session), not a contrived edge value. Fixed by
+    filtering `None`-valued datapoint attributes out of the merge before it overwrites
+    anything, closing this for every field the function merges, not only `session_id`.
+    Verify end-to-end through the real ingest path (not by calling `_common` with
+    hand-built dicts alone): an OTLP metrics POST with a resource-level UUID and a
+    datapoint-level unparseable `session.id` wrapper stores the resource UUID, not
+    `'unknown'`; a subsequent `cli` transcript record for that same UUID is then rejected
+    `session_has_otlp` with row counts over both tables unchanged -- verification:
+    integration test
+
+13. **Added after Phase 5 cycle-3 audit -- the seventh instance, one level upstream of
+    criterion 12's fix.** `_attrs` collapses duplicate attribute keys within a single
+    attribute list last-wins (it's a plain dict comprehension). If a `session.id` key
+    appears twice in one list and the second occurrence uses an unrecognized wrapper,
+    `_attrs` hands back `{"session.id": None}` **before** `_common`'s merge-level filter
+    (criterion 12) ever runs -- so the filter can't help, because by the time `_common`
+    sees it, there was never a valid value to protect. Reproduced identically to criterion
+    12: a real UUID `session.id` followed in the same list by any of
+    `arrayValue`/`kvlistValue`/`bytesValue`/`{}` for the same key collapses to `'unknown'`,
+    `(1,0) -> (5,1)` double-billed. Fixed at the true producer: `_attrs` itself drops a key
+    whose parsed value is `None` rather than ever returning it, so no downstream consumer
+    -- not `_common`'s merge, not any future caller -- can receive a spurious `None` for an
+    attribute that had *any* valid occurrence in the same list. This is what makes the fix
+    convergent rather than another instance of the pattern: the guard now lives at the one
+    place values are produced, not at each place they're consumed. `_common`'s existing
+    merge-level filter (criterion 12) may be simplified once this lands, or kept as
+    defense-in-depth -- implementer's call, documented either way -- verification:
+    integration test
 
 ## Files to Read
 

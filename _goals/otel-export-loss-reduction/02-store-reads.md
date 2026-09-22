@@ -177,6 +177,14 @@ eval_depth: full
     build (cap 32766) while production fails — it is the only way this class of defect
     is catchable in CI — verification: unit test
 
+16. **Added after Phase 5 final audit.** `sessions_with_otlp_rows` propagates
+    `sqlite3.Error` rather than swallowing it. Force the connection to raise (e.g. close it,
+    or corrupt the query via a monkeypatched `execute`) and assert the exception propagates
+    out of the call rather than being caught and turned into `set()`. Before this test
+    existed, a mutation adding `try/except sqlite3.Error: return set()` escaped all 421
+    tests -- `set()` reads downstream as "no OTLP rows, safe to insert", the double-billing
+    direction -- verification: unit test
+
 ## Files to Read
 
 - `billing/otel/otel_store.py` — the whole module; in particular the `token_usage` schema

@@ -117,3 +117,26 @@ eval_depth: light
 - `python -m pytest tests/ -q -k "config or settings or configure"` -> passing
 - Capture the `grep -rn "OTEL_METRIC_EXPORT_INTERVAL"` output verbatim in the report.
 - Capture the corrected `deploy/README.md` troubleshooting row verbatim.
+
+
+## Addendum — pilot-package retired (2026-09-21, after this task passed)
+
+This task was evaluated and PASSED while `pilot-package/` still existed, and everything
+above is an accurate record of that work. The user subsequently deleted `pilot-package/`
+entirely (confirmed dead in `README.md`: "superseded by `client-package/`... Kept for
+reference. Send anyone enrolling today the `client-package/` build instead") and it is no
+longer part of the repo.
+
+**Criteria retired, not deleted from the record:**
+- Criterion 2's pilot half (`pilot-package/settings.json` string-typing check) — retired.
+- Criterion 4 (`pilot-package/install.sh` heredoc JSON parse) — retired outright.
+  `client-package/install.sh` is a thin shim to `configure.py` and never wrote a JSON
+  heredoc, so there is no surviving equivalent to retarget this criterion onto. Its
+  coverage purpose (the interval value reaches a real settings write) is already carried
+  by criterion 3 (`configure.py`'s defaults dict).
+
+**Live going forward:** criteria 1, 2 (managed-settings half), 3, 5, 6, 7 — now checked
+against the **two** surviving config sources (`deploy/managed-settings.json`,
+`client-package/configure.py`) instead of four. `tests/test_cli_backfill.py`'s
+`test_01_ac01`/`test_01_ac02` are updated to drop the pilot-package paths;
+`test_01_ac04` is deleted. See `tests/COVERAGE_MAP.md` for the current mapping.

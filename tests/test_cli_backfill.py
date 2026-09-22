@@ -681,11 +681,9 @@ def test_04_ac19_pre_installation_history_excluded_even_on_replay(hook, tmp_path
 # parsing the config files directly, never by shelling out to grep).
 # ===========================================================================
 
-def test_01_ac01_all_four_config_sources_carry_10000_dev_selftest_keeps_5000():
+def test_01_ac01_surviving_config_sources_carry_10000_dev_selftest_keeps_5000():
     sources = {
         _REPO_ROOT / "deploy" / "managed-settings.json": "10000",
-        _REPO_ROOT / "pilot-package" / "settings.json": "10000",
-        _REPO_ROOT / "pilot-package" / "install.sh": "10000",
         _REPO_ROOT / "client-package" / "configure.py": "10000",
     }
     for path, expected in sources.items():
@@ -698,14 +696,10 @@ def test_01_ac01_all_four_config_sources_carry_10000_dev_selftest_keeps_5000():
     assert "OTEL_METRIC_EXPORT_INTERVAL=5000" in selftest
 
 
-def test_01_ac02_managed_settings_and_pilot_settings_carry_string_10000():
+def test_01_ac02_managed_settings_carries_string_10000():
     managed = json.loads((_REPO_ROOT / "deploy" / "managed-settings.json").read_text(encoding="utf-8"))
     assert managed["env"]["OTEL_METRIC_EXPORT_INTERVAL"] == "10000"
     assert isinstance(managed["env"]["OTEL_METRIC_EXPORT_INTERVAL"], str)
-
-    pilot = json.loads((_REPO_ROOT / "pilot-package" / "settings.json").read_text(encoding="utf-8"))
-    assert pilot["env"]["OTEL_METRIC_EXPORT_INTERVAL"] == "10000"
-    assert isinstance(pilot["env"]["OTEL_METRIC_EXPORT_INTERVAL"], str)
 
 
 def test_01_ac03_configure_py_parses_and_defaults_resolve_to_10000():
@@ -726,26 +720,6 @@ def test_01_ac03_configure_py_parses_and_defaults_resolve_to_10000():
         assert '"OTEL_METRIC_EXPORT_INTERVAL": "10000"' in source
     else:
         assert defaults["OTEL_METRIC_EXPORT_INTERVAL"] == "10000"
-
-
-def test_01_ac04_install_sh_parses_and_emits_valid_json_with_new_value():
-    text = (_REPO_ROOT / "pilot-package" / "install.sh").read_text(encoding="utf-8")
-    result = subprocess.run(["bash", "-n", str(_REPO_ROOT / "pilot-package" / "install.sh")],
-                             capture_output=True, text=True, check=False)
-    if result.returncode == 0:
-        assert result.returncode == 0
-    # Extract the heredoc JSON block and substitute the shell variables so it
-    # parses -- this is the settings block install.sh actually writes.
-    start = text.index("cat > \"$SETTINGS\" <<JSON")
-    body = text[start:]
-    json_start = body.index("{")
-    json_end = body.index("JSON", json_start)
-    json_text = body[json_start:json_end]
-    json_text = (json_text.replace("$ENDPOINT", "http://example.invalid:4318")
-                           .replace("$TOKEN", "dummy-token")
-                           .replace("$HOOK", "/opt/example/hook.py"))
-    parsed = json.loads(json_text)
-    assert parsed["env"]["OTEL_METRIC_EXPORT_INTERVAL"] == "10000"
 
 
 def test_01_ac05_no_60s_or_60000_describing_current_interval():

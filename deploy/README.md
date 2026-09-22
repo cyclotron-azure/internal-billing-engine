@@ -8,14 +8,15 @@
 **Four artifacts** get pushed to every developer machine. **All four are
 required** — one turns telemetry on, one tags it with the repo at launch, one
 keeps that tag correct as the developer moves between repos, and one recovers
-desktop-app usage the other three can't see at all.
+desktop-app usage the other three can't see at all, plus backfills CLI/VS Code
+usage whose own OTLP export didn't flush in time.
 
 | File | Job | Nature |
 |---|---|---|
 | `managed-settings.json` | Turn telemetry **ON** (enforced), point it at the billing receiver, carry the fleet token, register both hooks | **Static** — same on every machine |
 | `claude-wrapper.sh` | Tag each session with `repo=<git remote>` at launch | **Dynamic** — computed per session (see that file) |
 | `claude-repo-tag.py` | Record repo changes **during** a session (hook) | **Dynamic** — fires on every `cd` |
-| `claude-transcript-usage.py` | Ship desktop-app usage recovered from on-disk transcripts (hook) | **Dynamic** — fires on `SessionEnd` only |
+| `claude-transcript-usage.py` | Ship desktop-app usage recovered from on-disk transcripts, plus backfill `cli`/`claude-vscode` sessions whose own OTLP export never flushed (hook) | **Dynamic** — fires on `SessionEnd` only |
 
 Skipping any one of them fails in its own way:
 
@@ -27,7 +28,9 @@ Skipping any one of them fails in its own way:
   data, because it is confidently wrong.
 - **No transcript hook** → the desktop app's usage — which has no OTLP exporter
   at all — never reaches the receiver, so it bills to nobody, with nothing
-  reporting the gap.
+  reporting the gap. The same loss now also applies to `cli`/`claude-vscode`
+  sessions whose own OTLP export didn't flush before the process exited — this
+  hook is the only way that usage is ever recovered.
 
 ## Setup checklist
 
@@ -252,11 +255,11 @@ session, so you can see how much of the bill each signal is carrying.
 | All `absent` for some users | Those sessions never passed through the wrapper *or* the hook — likely a non-CLI surface | Confirm the hook is in **managed** settings (applies to all surfaces), not just user settings |
 | Hook exits non-zero | `python3` missing on the PATH | Install it, or rewrite the hook for an interpreter you do ship |
 | Timeline entries exist but usage still bills to one repo | Datapoints and timeline don't share a `session_id` — check `OTEL_METRICS_INCLUDE_SESSION_ID` is `true` | It's `true` by default; don't set it to `false` |
-| Multi-repo session split looks wrong by a small amount | A repo switch inside one 10s export interval lands wholly on one side | Expected at the current window; a false split this small is not worth further tightening (more traffic) |
+| Multi-repo session split looks wrong by a small amount | A repo switch inside one 10s export interval lands wholly on one side | Expected at the current window; a false split this small is not worth further tightening |
 
 ---
 
-## 3a. claude-transcript-usage.py (desktop-app usage)
+## 3a. claude-transcript-usage.py (desktop-app usage, plus CLI/VS Code backfill)
 
 The Claude Code **desktop app has no OTLP exporter** — telemetry export is a
 CLI-only capability (the VS Code extension only bills because it spawns the CLI
@@ -280,6 +283,33 @@ Unlike `claude-repo-tag.py`, which registers on five events, this hook is
 registered on **`SessionEnd` only** — it does real work (a recursive transcript
 sweep, not a small POST per firing) and a catch-up sweep on the next
 `SessionEnd` is what recovers a session whose own `SessionEnd` never fired.
+
+This same hook also backfills `cli`/`claude-vscode` sessions, which do have an
+OTLP exporter but can still lose usage if the session ends before the exporter's
+shutdown flush lands (`billing/otel/transcript.py:158`'s `ALLOWED_ENTRYPOINTS`
+now includes `claude-desktop`, `cli`, and `claude-vscode`). Two guards keep this
+from double-billing a session whose OTLP export *did* eventually arrive: the
+receiver rejects any `cli`/`claude-vscode` record whose session already has a
+matching OTLP row, with reason `session_has_otlp`
+(`billing/otel/receiver.py:583-587`), and it also quarantines a record until it
+is at least `BACKFILL_MIN_AGE_SECONDS` (900s server-side,
+`billing/otel/transcript.py:175`) old before accepting it. The hook itself
+applies a second, client-side quarantine of 1800s — deliberately double the
+server's 900s, so a record that clears the client gate can't still fail the
+server's tighter check (`deploy/claude-transcript-usage.py:186-197`) — before
+ever attempting to ship a `cli`/`claude-vscode` record; this does not apply to
+`claude-desktop`. On first run of this version of the hook, it also performs a
+one-time historical replay: it clears each file's resolved/examined state so
+previously-unshippable `cli`/`claude-vscode` history becomes eligible, not just
+sessions from here forward (`deploy/claude-transcript-usage.py:783-867`,
+tracked by the `cli_backfill_replay_at` state key). The replay does not reach
+further back than the machine's original install (`install_ts`), so
+pre-installation usage stays excluded — that usage was never captured by OTLP
+either, and billing it now would expand a client's invoice retroactively rather
+than recover lost telemetry. Each run also records local per-run tallies
+(shipped, rejected-by-reason, deferred —
+`deploy/claude-transcript-usage.py:978-983`'s `cli_backfill_last_run`) as a
+troubleshooting/verification aid.
 
 Ships no message content, prompt, tool output, or file path (`cwd` is
 deliberately excluded from the wire payload) — only usage metadata: token
@@ -338,9 +368,21 @@ docker compose logs receiver     # must print: auth=ENABLED
 - Listens on `:4318` for OTLP/JSON; captures `claude_code.token.usage` and
   `claude_code.cost.usage`, tagged with the repo. Also accepts the repo-tag
   hook's `POST /v1/session-repo` and the transcript hook's batched
-  `POST /v1/transcript-usage` (desktop-app usage).
+  `POST /v1/transcript-usage` (desktop, CLI, and VS Code usage).
 - SQLite store + request log persist in `./otel-data` on the host.
 - Stdlib-only image (no dependencies).
+
+### Verify on a machine
+
+```bash
+# unauthenticated liveness check
+curl -s http://127.0.0.1:4318/healthz
+# → {"status":"ok","now":"..."}
+
+# authenticated: adds ingest-freshness detail
+curl -s -H "Authorization: Bearer $RECEIVER_AUTH_TOKEN" http://127.0.0.1:4318/healthz
+# → adds "last_ingest_at", "last_otlp_ingest_at", "stale_seconds", "otlp_stale_seconds"
+```
 
 **`auth=DISABLED` in that log line means the receiver is open** — anything that can
 reach the port can write rows into billing truth. Fine for a localhost test, never

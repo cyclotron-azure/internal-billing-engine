@@ -26,19 +26,16 @@ never code**.
    justified no-op for an already-correct doc is a valid outcome.
 5. **HISTORICAL LOGS.** Dated notes under `_research/` are append/annotate territory,
    not rewrite-history. Promote only implemented ground truth into README.md.
-**DISTRIBUTABLE ARCHIVES ARE NOT DOCS.** `client-package.zip` and
-   `pilot-package.zip` are build outputs of `client-package/build.py`, not
-   documentation. Never edit or regenerate them here; if a doc change implies the
-   archive is stale, say so in the report and stop.
+**DISTRIBUTABLE ARCHIVES ARE NOT DOCS.** `client-package.zip` is a build output
+   of `client-package/build.py`, not documentation. Never edit or regenerate it
+   here; if a doc change implies the archive is stale, say so in the report and
+   stop.
 
 ## Documentation surface map
 
 In scope: **everything markdown EXCEPT `_research/` and `_goals/`** — READMEs, docs
 under `docs/`, per-directory instruction files, and `.claude/`
 skill/agent files.
-
-In scope: **everything markdown EXCEPT `_research/` and `_goals/`** — READMEs, docs
-under `docs/`, per-directory instruction files, and `.claude` skill/agent files.
 
 This project has five doc buckets and one canonical reference. `README.md` is the
 ground truth: it documents every module by name, the OTEL flow, the SQLite

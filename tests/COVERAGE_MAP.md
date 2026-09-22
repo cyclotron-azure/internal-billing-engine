@@ -69,7 +69,7 @@ through `07-integration.md` to the test node id that verifies it. Committed as o
 | 3. Unusable envelope → 400, writes nothing | `test_receiver.py::test_non_list_envelope_returns_400_and_writes_nothing`, `test_receiver.py::test_oversized_batch_returns_400_and_writes_nothing` |
 | 3b. Mixed valid/invalid batch → 200, valid inserted, invalid reported rejected | `test_receiver.py::test_mixed_batch_inserts_valid_and_rejects_invalid` |
 | 4. Re-POST identical batch → 200, zero new inserts | `test_receiver.py::test_replay_of_identical_batch_inserts_nothing_new` |
-| 5. `entrypoint='cli'` rejected, not inserted | `test_receiver.py::test_non_desktop_entrypoint_is_rejected` |
+| 5. Backfill entrypoint accepted when old enough with no OTLP row; out-of-set entrypoint still rejected | `test_receiver.py::test_backfill_entrypoint_is_accepted_when_old_enough_and_no_otlp_row`, `test_receiver.py::test_out_of_set_entrypoint_still_rejected_with_invalid_entrypoint` |
 | 6. Identity round-trips end to end | `test_receiver.py::test_identity_round_trips_to_stored_rows` |
 | 6b. `main` + `subagent` for same session_id: both stored, distinct `dp_key`s | `test_receiver.py::test_main_and_subagent_rows_preserve_distinct_query_source_and_keys` |
 | 7. Malformed-POST log line carries no request bytes | `test_receiver.py::test_malformed_post_log_line_contains_no_request_bytes` |
@@ -110,7 +110,7 @@ through `07-integration.md` to the test node id that verifies it. Committed as o
 
 | Criterion | Test node id(s) |
 |---|---|
-| 1. Only desktop entrypoint ships | `test_transcript_hook.py::test_ac1_only_desktop_entrypoint_ships` |
+| 1. Desktop and cli entrypoints ship, claude-vscode withheld pending trailing-group resolution; out-of-set entrypoint never ships | `test_transcript_hook.py::test_ac1_desktop_and_cli_entrypoints_ship_claude_vscode_withheld_trailing`, `test_transcript_hook.py::test_ac1_out_of_set_entrypoint_never_ships` |
 | 1b. Exact amount: terminal block, not sum, not first | `test_transcript_hook.py::test_ac1b_exact_amount_terminal_block_not_sum_not_first` |
 | 1c. Exact-duplicate pair collapses to one record | `test_transcript_hook.py::test_ac1c_duplicate_pair_both_nonnull_stop_reason_collapses_to_one` |
 | 1d/1d-bis. Subagent capture against real nested layout; anti-fixture check | `test_transcript_hook.py::test_ac1d_and_1d_bis_subagent_capture_and_anti_fixture` |
@@ -131,7 +131,7 @@ through `07-integration.md` to the test node id that verifies it. Committed as o
 | 7h. Transport failure never drops, eventually ships | `test_transcript_hook.py::test_ac7h_transport_failure_never_drops_eventually_ships` |
 | 8. Never opens `~/.claude/.credentials.json` | `test_transcript_hook.py::test_ac8_never_reads_credentials_json_static`, `test_ac8_never_reads_credentials_json_dynamic` |
 | 9. `deploy/managed-settings.json` valid, preserves existing, adds new | `test_configure.py::test_managed_settings_is_valid_json_dict`, `test_managed_settings_preserves_every_existing_registration`, `test_managed_settings_registers_transcript_hook_session_end_only`, `test_managed_settings_preserves_placeholder_token_convention` |
-| (supplemental, task 06b rollout) client-package build, `pilot-package` untouched, `.gitattributes` pins | `test_configure.py::test_transcript_hook_copies_are_equal_after_newline_normalization`, `test_build_contents_includes_transcript_hook`, `test_build_contents_files_all_exist_on_disk`, `test_pilot_package_not_touched`, `test_gitattributes_pins_deploy_py_to_lf`, `test_gitattributes_marks_golden_baseline_as_binary`, `test_gitattributes_preserves_preexisting_entries`, `test_git_check_attr_reports_lf_for_deploy_python_hooks`, `test_version_bumped_past_1_1_0` |
+| (supplemental, task 06b rollout) client-package build, `pilot-package` untouched, `.gitattributes` pins | `test_configure.py::test_transcript_hook_copies_are_equal_after_newline_normalization`, `test_build_contents_excludes_retired_transcript_hook`, `test_build_contents_files_all_exist_on_disk`, `test_pilot_package_not_touched`, `test_gitattributes_pins_deploy_py_to_lf`, `test_gitattributes_marks_golden_baseline_as_binary`, `test_gitattributes_preserves_preexisting_entries`, `test_git_check_attr_reports_lf_for_deploy_python_hooks`, `test_version_bumped_past_1_1_0` |
 
 ## Task 07 — `07-integration.md` (this task)
 
@@ -276,10 +276,10 @@ same `/v1/metrics` + `/v1/transcript-usage` harness. Task 01's criteria live in
 
 | Criterion | Test node id(s) |
 |---|---|
-| 1. All four config sources carry `10000`; `dev-selftest.sh` keeps `5000` | `test_cli_backfill.py::test_01_ac01_all_four_config_sources_carry_10000_dev_selftest_keeps_5000` |
-| 2. `managed-settings.json` / `pilot-package/settings.json` carry string `"10000"` | `test_cli_backfill.py::test_01_ac02_managed_settings_and_pilot_settings_carry_string_10000` |
+| 1. Surviving config sources (`deploy/managed-settings.json`, `client-package/configure.py`) carry `10000`; `dev-selftest.sh` keeps `5000` | `test_cli_backfill.py::test_01_ac01_surviving_config_sources_carry_10000_dev_selftest_keeps_5000` |
+| 2. `managed-settings.json` carries string `"10000"` | `test_cli_backfill.py::test_01_ac02_managed_settings_carries_string_10000` |
 | 3. `configure.py` parses; defaults dict resolves to `"10000"` | `test_cli_backfill.py::test_01_ac03_configure_py_parses_and_defaults_resolve_to_10000` |
-| 4. `install.sh` parses; emitted settings block is valid JSON with the new value | `test_cli_backfill.py::test_01_ac04_install_sh_parses_and_emits_valid_json_with_new_value` |
+| 4. `install.sh` parses; emitted settings block is valid JSON with the new value | **GAP** — `pilot-package/install.sh` no longer exists and `client-package/install.sh` never wrote a JSON heredoc, so there is no surviving mechanism this criterion describes. Not represented by a test; recorded as a GAP per this file's own contract rather than omitted. |
 | 5. No `60s`/`60000` describing the current export interval in `deploy/README.md`/`README.md` | `test_cli_backfill.py::test_01_ac05_no_60s_or_60000_describing_current_interval` |
 | 6. `git diff --stat` touches exactly the six files in task 01's write set | `test_cli_backfill.py::test_01_ac06_git_diff_stat_touches_exactly_the_six_files` |
 | 7. No pre-existing test asserts the old `60000` value | `test_cli_backfill.py::test_01_ac07_no_test_asserts_the_old_60000_value` |
@@ -303,6 +303,7 @@ same `/v1/metrics` + `/v1/transcript-usage` harness. Task 01's criteria live in
 | 13. C1: cost-only session via `insert_cost_datapoint` alone is returned | `test_store_reads.py::test_ac13_cost_only_session_via_insert_cost_datapoint_alone_is_returned` |
 | 14. `last_ingest_at` reflects a newer `cost_usage` row, filtered and unfiltered | `test_store_reads.py::test_ac14_last_ingest_at_reflects_newer_cost_row` |
 | 15. Parameter-cap regression: 500-id chunk under `setlimit(999)` | `test_store_reads.py::test_ac15_full_500_id_chunk_succeeds_under_999_variable_cap` |
+| 16. `sqlite3.Error` propagates out of `sessions_with_otlp_rows`, not swallowed into `set()` | `test_store_reads.py::test_ac16_sqlite_error_propagates_not_swallowed` |
 
 ## Task 03 — `03-receiver-health-and-cli-ingest.md`
 
@@ -362,16 +363,26 @@ same `/v1/metrics` + `/v1/transcript-usage` harness. Task 01's criteria live in
 | 3. `typeof(session_id)=='text'`, equals `str(python value)` for all 9 wrappers | `test_receiver_health.py::test_06_ac03_typeof_session_id_is_text_and_equals_str_python_value` (parametrized, 5 cases) |
 | 4. `dp_key` unchanged by coercion; dedupe intact | `test_receiver_health.py::test_06_ac04_dp_key_unchanged_by_coercion_and_dedupe_intact` |
 | 5. Ordinary UUID session is byte-identical to the pre-fix value | `test_receiver_health.py::test_06_ac05_ordinary_uuid_session_is_byte_identical_to_prefix_value` |
-| 6. Absent/falsy `session.id` still stores `unknown` | `test_receiver_health.py::test_06_ac06_falsy_or_absent_session_id_stores_unknown` (parametrized, 3 cases) |
+| 6a. Present-but-falsy `session.id` (`0`, `False`, `0.0`, `''`) keeps its own `str()` spelling, not `unknown` | `test_receiver_health.py::test_06_ac06_present_but_falsy_session_id_keeps_own_spelling` (parametrized, 3 cases) |
+| 6b. Genuinely absent `session.id` still stores `unknown` (unchanged) | `test_receiver_health.py::test_06_ac11_genuinely_absent_session_id_still_stores_unknown` |
 | 7. `user_email={"a":1}` still `store_error:ProgrammingError` (new test, per orchestrator correction) | `test_receiver_health.py::test_06_ac07_user_email_dict_still_raises_programming_error` |
 | 8. Targeted five-file selection: 8 failed / 166 passed, all owned by task 05 | Property of the full targeted run (see this task's completion report); the eight are inverted in `test_transcript.py`, `test_receiver.py`, `test_transcript_hook.py`, `test_integration_desktop.py` per the seven-hunk list above. |
 | 9. `git diff` on `receiver.py` confined to `_common` plus comments | `test_receiver_health.py::test_06_ac09_other_ingest_paths_unaffected_by_common_coercion` (behavioral confinement -- a byte-level `git diff` isolation needs the pre-task-06 scratchpad snapshot, not available to a durable checked-in test; see the test's own docstring) |
+| 10. **The None-vs-falsy fix.** `intValue "0"`, `boolValue false`, `doubleValue 0.0` store `'0'`/`'False'`/`'0.0'` (not `'unknown'`); a `cli` transcript record for that same id is then correctly excluded `session_has_otlp`, row counts unchanged | `test_receiver_health.py::test_06_ac10_falsy_session_id_now_correctly_excludes_matching_cli_record` |
+| 11. **The genuinely-absent case is unchanged.** An OTLP datapoint with no `session.id` attribute at all still stores `'unknown'` | `test_receiver_health.py::test_06_ac11_genuinely_absent_session_id_still_stores_unknown` (same test satisfies both the 6b split above and this citation -- the genuinely-absent behavior is one fact, asserted once) |
+| 12. **The merge-level None-clobber fix (sixth double-billing path).** A resource-level UUID `session.id` survives an unparseable datapoint-level `session.id` wrapper (`arrayValue`, `kvlistValue`, `bytesValue`, `{}`) instead of being clobbered to `'unknown'`; a subsequent `cli` transcript record for that UUID is then rejected `session_has_otlp` with row counts over both tables unchanged; a control confirms a genuine falsy datapoint value still overrides the resource | `test_receiver_health.py::test_06_ac12_unparseable_datapoint_wrapper_does_not_clobber_resource_level_session_id` (parametrized, 4 cases), `test_06_ac12_control_datapoint_genuine_falsy_value_still_overrides_resource` |
+| 13. **`_attrs` drops `None`-valued keys entirely (seventh double-billing path, one level upstream of 12).** A `session.id` key appearing twice within ONE attribute list -- once as a valid UUID `stringValue`, once as an unparseable wrapper -- keeps the valid UUID regardless of which occurrence comes first, and regardless of whether the duplicate pair lives in the resource's own attribute list or the datapoint's own attribute list; a subsequent `cli` transcript record for that UUID is then rejected `session_has_otlp` with row counts over both tables unchanged | `test_receiver_health.py::test_06_ac13_duplicate_session_id_key_in_one_list_keeps_first_valid_occurrence` (parametrized, 4 cases: `order` x `duplicate_at`) |
 
 ## GAPs (explicit)
 
-Criterion 03.18's and 04.18's "list every pre-existing test your change breaks" are
-documentation properties, not independently re-derivable by a unit test -- both are
-represented above by a lightweight pin test that checks the expected test names/negative
-cases are present, per this goal's context package. Task 06 criterion 8 (the targeted
-five-file failure count) is a command-output property of the full run, not a single node
-id, consistent with how other command-output criteria are handled elsewhere in this file.
+Task 01 criterion 4 (`install.sh` parses and emits a valid-JSON settings block with the
+new value) has no test. `pilot-package/install.sh` -- the file the criterion was written
+against -- no longer exists in the tree, and `client-package/install.sh` never wrote a
+JSON heredoc, so there is no surviving mechanism to test; inventing one would test a
+shape the codebase doesn't have. Criterion 03.18's and 04.18's "list every pre-existing
+test your change breaks" are documentation properties, not independently re-derivable by
+a unit test -- both are represented above by a lightweight pin test that checks the
+expected test names/negative cases are present, per this goal's context package. Task 06
+criterion 8 (the targeted five-file failure count) is a command-output property of the
+full run, not a single node id, consistent with how other command-output criteria are
+handled elsewhere in this file.

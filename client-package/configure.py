@@ -28,9 +28,9 @@ WHY THIS EXISTS AND pilot-package/install.sh DOES NOT SUFFICE
   * install.sh is bash; Windows developers cannot run it. The hook also cannot be
     invoked by bare path on Windows (no .py association without the py launcher),
     so the hook command must name the interpreter explicitly.
-  * pilot-package/settings.json sets OTEL_LOGS_EXPORTER=none, which deploy/README.md
-    warns makes Claude Code error on startup and exit. We omit the key, and delete
-    it from machines that ran the pilot.
+  * the earlier, now-removed pilot package's settings.json set OTEL_LOGS_EXPORTER=none,
+    which deploy/README.md warns makes Claude Code error on startup and exit. We omit
+    the key, and delete it from machines that ran the pilot.
 """
 
 from __future__ import annotations
@@ -147,8 +147,9 @@ COLLECTION_NOTICE = """
 This configures Claude Code to report usage to your company's billing receiver.
 
   Collected:     the git remote of the repo you work in, the model, token counts
-                 and cost, your work email, a session id, and timestamps.
-  Not collected: your prompts, your code, file contents, or file paths.
+                 and cost, your work email, a session id, timestamps, and the
+                 working directory path of the repo you're in.
+  Not collected: your prompts, your code, or file contents.
 
 It installs under your home directory only, needs no administrator rights, and
 is reversible - see INSTRUCTIONS.md, or run the Uninstall launcher.

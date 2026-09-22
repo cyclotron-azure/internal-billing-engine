@@ -85,14 +85,16 @@ line means anyone who can reach the port can write billing rows.
 `.claude/settings.local.json` (gitignored) points this machine at a local receiver,
 so a `claude` session in this repo produces real rows. `deploy/dev-selftest.sh` does
 the same as a one-off launcher without changing your settings. Telemetry starts with
-the **next** session, and exports every 10s — so give it a few seconds before checking.
+the **next** session; `dev-selftest.sh` exports every 5s, so give it a few seconds
+before checking (your own `.claude/settings.local.json` may set a different
+interval — Claude Code's own default is 60s).
 
 ---
 
 ## 1: Receiving telemetry data
 The engine gets data via an OTLP/JSON receiver (receiver.py) that ingests telemetry emitted by Claude Code on each dev machine. Deduped datapoints are stored in a single-host SQLite database.
 
-The same receiver also accepts `POST /v1/session-repo` — not an OTLP endpoint, but the session→repo timeline written by the `claude-repo-tag.py` hook. Claude Code freezes `OTEL_RESOURCE_ATTRIBUTES` at launch, so the wrapper's `repo=` tag can't follow a developer who `cd`s into another client's repo mid-session; the timeline can, and `attribute.py` joins it back onto each datapoint at billing time. It also accepts `POST /v1/transcript-usage` — a batched, authenticated endpoint that ingests desktop-app usage recovered from on-disk Claude Code transcripts by the `claude-transcript-usage.py` hook (see `billing/otel/transcript.py`). Writes are authenticated with a shared fleet token (`RECEIVER_AUTH_TOKEN`).
+The same receiver also accepts `POST /v1/session-repo` — not an OTLP endpoint, but the session→repo timeline written by the `claude-repo-tag.py` hook. Claude Code freezes `OTEL_RESOURCE_ATTRIBUTES` at launch, so the wrapper's `repo=` tag can't follow a developer who `cd`s into another client's repo mid-session; the timeline can, and `attribute.py` joins it back onto each datapoint at billing time. It also accepts `POST /v1/transcript-usage` — a batched, authenticated endpoint that ingests desktop-app, CLI, and VS Code usage recovered from on-disk Claude Code transcripts by the `claude-transcript-usage.py` hook (see `billing/otel/transcript.py`). Writes are authenticated with a shared fleet token (`RECEIVER_AUTH_TOKEN`). The receiver also exposes `GET /healthz` for liveness checking.
 
 ## 2: Push data to ADLS
 A scheduler (scheduler.py) regenerates two flat all-history CSVs (claudeuseagesummary, claudeusagelineitems) and enqueues them. Sync worker (fabric_sync.py) drains outbox and uploads to ADLS (rg-cyclotron-insights > sacyclotroninsights > cyclotroninsights), overwriting each file. Scheduled daily but can be modified (SYNC_FREQUENCY in .env).
@@ -112,7 +114,6 @@ billing/            Python package — both pipelines + reconciliation
   otel/             the OTEL (repo-level) path
 deploy/             client-side config pushed to dev machines (MDM, enforced)
 client-package/     opt-in, one-click installer developers run themselves
-pilot-package/      the earlier opt-in package — superseded by client-package/
 fabric/             Fabric-side notebook + docs (CSV → Delta tables)
 data/               generated SQLite stores + logs (gitignored)
 .claude/            local Claude Code settings (gitignored)
@@ -122,8 +123,9 @@ docker-compose.yml  receiver + sync worker services
 
 There are **two enrolment tracks** onto the same receiver: the enforced MDM track
 (`deploy/`) and the opt-in double-click track (`client-package/`). They install the
-same hook and the same telemetry env; they differ only in who applies it and
-whether a developer can remove it.
+same repo-tag hook and the same telemetry env — the MDM track additionally installs
+a transcript-usage hook that the opt-in track omits; otherwise they differ only in
+who applies it and whether a developer can remove it.
 
 ### `billing/` — the engine
 
@@ -145,7 +147,7 @@ Shared:
 
 ### `billing/otel/` — the OTEL (repo-level) path
 
-- **`receiver.py`** — minimal OTLP/JSON HTTP server. Accepts `claude_code.token.usage` and `claude_code.cost.usage` from Claude Code (handles chunked + gzip bodies), extracts repo/user/model/token-type, dedupes, writes to the store. Also accepts `POST /v1/session-repo` from the repo-tag hook, and `POST /v1/transcript-usage` — a batched endpoint for desktop-app usage recovered from on-disk transcripts (see `transcript.py` below), with per-record rejection so one malformed record never costs the rest of a batch its billing. Every POST must present the shared fleet token (`X-Billing-Token` or `Authorization: Bearer`) once `RECEIVER_AUTH_TOKEN` is set; unset means open, with a loud startup warning.
+- **`receiver.py`** — minimal OTLP/JSON HTTP server. Accepts `claude_code.token.usage` and `claude_code.cost.usage` from Claude Code (handles chunked + gzip bodies), extracts repo/user/model/token-type, dedupes, writes to the store. Also accepts `POST /v1/session-repo` from the repo-tag hook, and `POST /v1/transcript-usage` — a batched endpoint for desktop-app, CLI, and VS Code usage recovered from on-disk transcripts (see `transcript.py` below), with per-record rejection so one malformed record never costs the rest of a batch its billing. Exposes `GET /healthz` for liveness, with authenticated freshness detail when the bearer token matches `RECEIVER_AUTH_TOKEN`. Every POST must present the shared fleet token (`X-Billing-Token` or `Authorization: Bearer`) once `RECEIVER_AUTH_TOKEN` is set; unset means open, with a loud startup warning.
   `python -m billing.otel.receiver` (`--host`, `--port`, `--db`, `--require-auth`)
 - **`transcript.py`** — the wire-payload contract for `POST /v1/transcript-usage`: a 14-field schema (fail-closed — an unknown field, including `cwd`, is a per-record rejection, never silently ignored), per-record validation, `MAX_BATCH_SIZE=500`, and the mapping from one validated record to its `token_usage` rows (terminal-block collapse already done client-side) plus a rate-card-costed `cost_usage` row. Pure and stdlib-only — no I/O, no store access.
 - **`attribute.py`** — resolves *which repo a datapoint bills to*, at query time. Joins the `session_repo_timeline` onto each datapoint as-of its own timestamp, so a session that moved between repos splits across them. Falls back through `desktop-scratch → timeline → absent → no_remote → wrapper` (checked in that order — `desktop-scratch` is deliberately first: a scratch desktop session still gets a timeline row, but one that carries no billable repo, so it must be claimed before the `timeline` branch would otherwise claim it), and exposes that choice as `attribution_source` so you can see which signal is carrying the bill. Resolution is derived, never stored: a late or corrected timeline retroactively fixes past bills with no re-ingest.
@@ -180,7 +182,8 @@ Shared:
   `/v1/session-repo`. Unlike the wrapper it runs on **every** Claude Code surface,
   not just the CLI. Designed never to break a session: always exits 0.
 - **`claude-transcript-usage.py`** — a second, standalone hook that ships
-  desktop-app usage the OTLP exporter can't see: it reads Claude Code's on-disk
+  desktop-app usage the OTLP exporter can't see, plus a CLI/VS Code backfill for
+  usage an export never flushed: it reads Claude Code's on-disk
   transcripts (recursively, so it also reaches subagent/sidechain files and
   crashed sessions in other project directories), collapses each API request's
   cumulative streaming blocks to its terminal block, and POSTs batches of
@@ -201,7 +204,7 @@ Shared:
 ### `client-package/` — opt-in rollout (developers install it themselves)
 
 The distributable, double-click alternative to the MDM track — same receiver, same
-hook, no admin rights, fully reversible. Built into `client-package.zip` at the
+repo-tag hook (not the transcript-usage hook), no admin rights, fully reversible. Built into `client-package.zip` at the
 repo root by `build.py`, which bakes the endpoint + token into the archive so
 developers never open a terminal.
 
@@ -217,14 +220,9 @@ developers never open a terminal.
   add a platform, write another shim rather than reimplementing the merge.
 - **`Install`/`Verify`/`Uninstall` `.command` / `.bat`** — the one-click launchers
   (macOS / Windows), wrapping `install.sh` / `install.ps1`.
-
-### `pilot-package/` — superseded
-
-The original opt-in package: bash-only, refused to touch an existing
-`~/.claude/settings.json`, and set `OTEL_LOGS_EXPORTER=none` (which Claude Code
-rejects — see `deploy/README.md`). Kept for reference. **Send anyone enrolling
-today the `client-package/` build instead**; running its installer also cleans up
-the bad key on machines that ran the pilot.
+- Running this installer also cleans up the bad `OTEL_LOGS_EXPORTER=none` key
+  (which Claude Code rejects — see `deploy/README.md`) left behind on any
+  machine that ran the earlier, now-removed pilot package.
 
 ### `data/` — generated (gitignored)
 
@@ -456,7 +454,8 @@ The pilot exists to produce numbers that cannot be estimated:
 - **Coverage** — `python -m billing.reconcile --start … --end …`. The funnel
   (truth → captured → repo-tagged) is the acceptance test. truth→captured is
   telemetry loss (roaming, restarts, short sessions dropped before a metric
-  export interval flushes, desktop-app sessions not yet swept); captured→tagged
+  export interval flushes, desktop-app/CLI/VS Code sessions not yet swept by the
+  transcript hook); captured→tagged
   is the `unknown`
   bucket (sessions outside a git repo). `--daily`/`--by-surface` (or `--detail`
   for both) break the funnel down per-day and per-surface, so a receiver
@@ -511,7 +510,8 @@ Push via MDM in waves (10% → 50% → 100%), watching receiver load and the
 `claude-repo-tag.py`, and `claude-transcript-usage.py`. The repo-tag hook is what
 keeps a mid-session repo switch from billing to the wrong client, and it is the
 only one that covers non-CLI surfaces; the transcript hook is what recovers
-desktop-app usage that has no OTLP exporter at all.
+desktop-app usage that has no OTLP exporter at all, plus CLI and VS Code usage
+whose export never flushed.
 
 1. `managed-settings.json` to the system path for each OS, with the real fleet
    token substituted for the placeholders.
@@ -535,8 +535,8 @@ desktop-app usage that has no OTLP exporter at all.
    looks like success while being entirely unbillable. Wrapper without the
    repo-tag hook bills mid-session repo switches to the wrong client — which is
    worse than not billing, because it's wrong rather than missing. Without the
-   transcript hook, desktop-app usage simply never bills anyone, with nothing
-   reporting it as missing.
+   transcript hook, desktop-app usage simply never bills anyone, and a CLI/VS Code
+   export that never flushed stays lost too, with nothing reporting it as missing.
 6. Verify per wave using `deploy/README.md`, and confirm the managed-settings path
    against the installed Claude Code version rather than trusting the table.
    `bill.py`'s ATTRIBUTION SOURCE breakdown is the fastest read on whether the

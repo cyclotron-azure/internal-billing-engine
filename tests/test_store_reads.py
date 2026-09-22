@@ -23,6 +23,8 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 
+import pytest
+
 from billing.otel.otel_store import OtelStore, OTLP_MEMBERSHIP_CHUNK_SIZE
 
 from tests.test_dedupe_counter import _ExecuteSpy
@@ -414,3 +416,25 @@ def test_ac15_full_500_id_chunk_succeeds_under_999_variable_cap(tmp_db_path):
         assert found == set(existing)
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Criterion 16 -- a sqlite3.Error raised mid-query propagates out of
+# sessions_with_otlp_rows rather than being caught and turned into set().
+# ---------------------------------------------------------------------------
+
+def test_ac16_sqlite_error_propagates_not_swallowed(tmp_db_path):
+    store = OtelStore(tmp_db_path)
+    try:
+        store.insert_datapoint(**_otlp_kwargs(session_id="sess-boom"))
+        store.commit()
+
+        def _on_execute(sql):
+            if "WITH ids(x) AS" in sql:
+                raise sqlite3.OperationalError("simulated disk I/O error")
+
+        store.db = _ExecuteSpy(store.db, on_execute=_on_execute)
+        with pytest.raises(sqlite3.Error):
+            store.sessions_with_otlp_rows(["sess-boom"])
+    finally:
+        store.db._real.close()
