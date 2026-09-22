@@ -7,7 +7,7 @@ services:
     image: cyclotron/billing-otel-receiver
     restart: unless-stopped
     ports:
-      - "4318:4318"          # OTLP/JSON in; front with TLS in production (see below)
+      - "127.0.0.1:4318:4318"
     volumes:
       - ./otel-data:/data
     environment:
@@ -33,15 +33,10 @@ services:
       OTEL_DB: /data/otel.db
     command: ["python", "-m", "billing.otel.scheduler", "--loop"]
 
-  # --- TLS / durability (recommended for production) ------------------------
-  # Dev machines should hit an HTTPS endpoint, not raw :4318. Put a reverse
-  # proxy (Caddy/nginx) or an OpenTelemetry Collector in front, terminating TLS
-  # and forwarding to receiver:4318, then set managed-settings.json's
-  # OTEL_EXPORTER_OTLP_ENDPOINT to that HTTPS URL. Example Caddy sidecar:
-  #
-  # proxy:
-  #   image: caddy:2
-  #   restart: unless-stopped
-  #   ports: ["443:443"]
-  #   command: caddy reverse-proxy --from otel-billing.internal.cyclotron.com --to receiver:4318
-  #   depends_on: [receiver]
+  # TLS
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["443:443"]
+    command: caddy reverse-proxy --from otel-billing-receiver.westus2.cloudapp.azure.com --to receiver:4318
+    depends_on: [receiver]
