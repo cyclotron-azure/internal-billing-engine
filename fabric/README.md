@@ -31,9 +31,9 @@ You'll see `Files/claude-billing/claudeusagesummary.csv` and `…lineitems.csv`.
 Repeat for `claudeusagelineitems.csv`. (Re-run to refresh.)
 
 **Option B — running, automatic (recommended):** run `refresh_billing_tables.py`
-in a Fabric notebook and **schedule it after the sync** (e.g. sync 23:30 → notebook
-23:45). It overwrites both Delta tables from the full-history CSVs each run, so the
-tables stay current with no duplicates.
+in a Fabric notebook and **schedule it after the sync** (e.g. sync 00:00 UTC →
+notebook 00:15 UTC). It overwrites both Delta tables from the full-history CSVs
+each run, so the tables stay current with no duplicates.
 
 ## Result
 
@@ -100,10 +100,11 @@ the repo name. Two things to get right before billing on it:
   someone clears before the invoice is issued. **Never default an unmapped repo to
   a client.**
 - **Mind the refresh order.** `repoclientmap` refreshes from the SharePoint sheet
-  daily at **23:59 PST**, but the sync ships CSVs at **23:30 UTC** (16:30 PST) and
-  this notebook runs shortly after — so it can join against a map up to a day
-  stale, and a repo mapped today won't bill correctly until tomorrow. It is also
-  the one PST schedule in an otherwise all-UTC pipeline, so DST shifts it twice a
+  daily at **23:59 PST**, but the sync ships CSVs at **00:00 UTC** (16:00 PST, the
+  previous day) and this notebook runs shortly after — so it can join against a
+  map up to a day stale, and a repo mapped today won't bill correctly until
+  tomorrow. It is also the one PST schedule in an otherwise all-UTC pipeline, so
+  DST shifts it twice a
   year relative to everything else.
 
 The mapping sheet is a billing input, not a convenience: see Phase 6 of the

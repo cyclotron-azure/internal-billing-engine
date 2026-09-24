@@ -38,9 +38,9 @@ load_env()
 # frequency -> (crontab schedule, approx loop interval in seconds)
 FREQUENCIES = {
     "hourly":  {"cron": "0 * * * *",   "seconds": 3600},
-    "daily":   {"cron": "30 23 * * *", "seconds": 86_400},
-    "weekly":  {"cron": "30 23 * * 0", "seconds": 604_800},
-    "monthly": {"cron": "30 23 1 * *", "seconds": 2_592_000},
+    "daily":   {"cron": "0 0 * * *",   "seconds": 86_400},
+    "weekly":  {"cron": "0 0 * * 0",   "seconds": 604_800},
+    "monthly": {"cron": "0 0 1 * *",   "seconds": 2_592_000},
 }
 DEFAULT_FREQUENCY = "daily"
 

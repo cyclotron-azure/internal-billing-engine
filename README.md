@@ -547,14 +547,14 @@ whose export never flushed.
 **Use a systemd timer — not the `--loop` service, and not plain cron.**
 
 The `sync` compose service calls `time.sleep(86_400)`; with
-`restart: unless-stopped`, every reboot resets the phase, so "daily 23:30" drifts
+`restart: unless-stopped`, every reboot resets the phase, so "daily 00:00" drifts
 to whenever the box last came up. A systemd timer with `Persistent=true` also
 catches runs missed while the VM was down, and gives `journalctl` history and
 exit-code handling for free.
 
 ```
 # scheduler --emit-cron prints the equivalent line
-30 23 * * *  cd /opt/cyclotron/internal-billing-engine && ./deploy/run-sync.sh
+0 0 * * *  cd /opt/cyclotron/internal-billing-engine && ./deploy/run-sync.sh
 ```
 
 **Drop the `sync` service from `docker compose up`** so two schedulers aren't
@@ -566,7 +566,7 @@ or partial. `refresh_billing_tables.py` overwrites the Delta tables from those
 CSVs — firing inside that window overwrites a good table with a truncated one.
 Cheapest fix first:
 
-- Schedule the notebook with a wide margin (sync 23:30 UTC → notebook 00:30 UTC)
+- Schedule the notebook with a wide margin (sync 00:00 UTC → notebook 01:00 UTC)
   **and** have it sanity-check row count + `generated_at` before overwriting.
 - Better: upload to `<name>.tmp` and copy to the final path on success, so readers
   only ever see complete files.
@@ -589,13 +589,13 @@ engine and the Fabric notebook can disagree.
    someone has to clear before the invoice is issued. **Never default an unmapped
    repo to a client.**
 2. **Fix the refresh ordering.** The dataflow refreshes `repoclientmap` daily at
-   **23:59 PST**, but the sync ships CSVs at **23:30 UTC** (= 16:30 PST) and the
-   Delta-table notebook runs shortly after. So the invoice notebook can join
-   against a map that is up to a day stale — a repo mapped today won't bill
-   correctly until tomorrow. Either move the dataflow ahead of the notebook or
-   have the notebook trigger/verify the refresh before joining. Also note this is
-   the one **PST** schedule in an otherwise all-UTC pipeline; DST shifts it twice
-   a year relative to everything else.
+   **23:59 PST**, but the sync now ships CSVs at **00:00 UTC** (= 16:00 PST, the
+   previous day) and the Delta-table notebook runs shortly after. So the invoice
+   notebook can join against a map that is up to a day stale — a repo mapped
+   today won't bill correctly until tomorrow. Either move the dataflow ahead of
+   the notebook or have the notebook trigger/verify the refresh before joining.
+   Also note this is the one **PST** schedule in an otherwise all-UTC pipeline;
+   DST shifts it twice a year relative to everything else.
 3. **Make the mapping auditable.** A SharePoint workbook has no meaningful version
    history for billing purposes — you cannot reconstruct which mapping produced
    last quarter's invoice, which is exactly what a client dispute asks for.

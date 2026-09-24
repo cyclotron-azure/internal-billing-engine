@@ -8,8 +8,8 @@
 # --- Schedule it ------------------------------------------------------------
 # Print the crontab line matching your SYNC_FREQUENCY:
 #   python3 -m billing.otel.scheduler --emit-cron
-# e.g. daily at 23:30:
-#   30 23 * * *  cd /opt/cyclotron/internal-billing-engine && ./deploy/run-sync.sh >> /var/log/billing-sync.log 2>&1
+# e.g. daily at 00:00 UTC:
+#   0 0 * * *  cd /opt/cyclotron/internal-billing-engine && ./deploy/run-sync.sh >> /var/log/billing-sync.log 2>&1
 #
 # Alternatively run the long-running self-pacing loop instead of cron:
 #   python3 -m billing.otel.scheduler --loop      (or the `sync` service in docker-compose)
