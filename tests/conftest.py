@@ -18,12 +18,18 @@ Every fixture that needs a database uses `tmp_path`. Nothing here ever touches
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from billing import reconcile as _reconcile
+from billing.otel import bill as _bill
+from billing.otel import otel_store as _otel_store
+from billing.otel import receiver as _receiver
 from billing.otel.otel_store import OtelStore
 
 # ---------------------------------------------------------------------------
@@ -596,3 +602,291 @@ def seeded_otlp_db_path(tmp_path) -> str:
     seed_otlp_rows(store)
     store.close()
     return path
+
+
+# ---------------------------------------------------------------------------
+# 4. Cowork isolation goal (task 00) -- fixtures for the new, separate Cowork
+#    ingestion pipeline, AND the pre-goal golden isolation baseline capture.
+#
+# Everything below is ADDITIVE. Per the goal's hard isolation constraint
+# (_goals/cowork-telemetry-ingest/goal.md), no file under billing/ is ever
+# touched by this goal, and this task's own write fence is tests-only.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def cowork_db_path(tmp_path) -> str:
+    """A path for the NEW, separate Cowork database -- distinct from
+    tmp_db_path / legacy_schema_db_path / seeded_otlp_db_path above, and
+    never `data/cowork.db`. The file does not exist yet; nothing in this
+    file creates it eagerly."""
+    return str(tmp_path / "cowork.db")
+
+
+# --- read-only-lookup fixture for Cowork repo attribution ------------------
+#
+# Requirement: "a small, deterministic otel.db-shaped database ... with at
+# least one session_repo_timeline row and a matching token_usage/cost_usage
+# row for the SAME session_id." `seeded_otlp_db_path` above ALREADY satisfies
+# this: SEEDED_SESSIONS[0] ("sess-otlp-001") carries a session_repo_timeline
+# entry (timeline_event=True) AND its own token_usage/cost_usage rows, all
+# built through the real OtelStore insert path. Reused here rather than
+# hand-rolling a parallel fixture -- see this task's own instruction to reuse
+# rather than duplicate. The session id is re-exported below under a
+# Cowork-specific name so downstream fixtures/tests don't need to know which
+# seeded session happens to carry the timeline row. `seeded_otlp_db_path`
+# itself doubles as the read-only-lookup fixture; no new database-building
+# fixture is added for it.
+COWORK_LOOKUP_SESSION_ID = SEEDED_SESSIONS[0]["session_id"]
+assert SEEDED_SESSIONS[0]["timeline_event"] is True, (
+    "COWORK_LOOKUP_SESSION_ID must name the one seeded session that actually "
+    "carries a session_repo_timeline row -- see seed_otlp_rows above"
+)
+
+
+# --- synthetic Cowork OTLP/JSON payload ------------------------------------
+#
+# Wire shape matches billing/otel/sample_payload.py's own OTLP/JSON builder
+# and what receiver.py's _attrs/_datapoints/_common actually parse (both
+# read-only, never modified by this goal).
+
+COWORK_SERVICE_NAME = "cowork"
+COWORK_TERMINAL_TYPE = "non_interactive"
+COWORK_USER_EMAIL = "cowork-user@cyclotron.com"
+COWORK_MODEL = "claude-sonnet-5"
+COWORK_QUERY_SOURCE = "main"
+COWORK_INPUT_TOKENS = 4_321
+COWORK_OUTPUT_TOKENS = 1_234
+COWORK_COST_USD = 2.5
+# A fixed instant, distinct from BASE_NANO (section 3) above. No wall-clock.
+COWORK_BASE_NANO = 1_767_312_000_000_000_000  # 2026-01-02T00:00:00Z
+
+
+def _cowork_kv(key: str, value) -> dict:
+    """The same {key, value: {stringValue|intValue|...}} wrapper shape
+    sample_payload.py's own `_kv` builds, reproduced locally so this fixture
+    depends only on the documented OTLP/JSON wire shape, never on a
+    production module's private helper."""
+    if isinstance(value, bool):
+        v = {"boolValue": value}
+    elif isinstance(value, int):
+        v = {"intValue": str(value)}
+    else:
+        v = {"stringValue": str(value)}
+    return {"key": key, "value": v}
+
+
+def build_cowork_metrics_payload(
+    *,
+    service_name: str | None = COWORK_SERVICE_NAME,
+    session_id: str = COWORK_LOOKUP_SESSION_ID,
+    user_email: str = COWORK_USER_EMAIL,
+    terminal_type: str | None = COWORK_TERMINAL_TYPE,
+    token_metric_name: str = "claude_code.token.usage",
+    cost_metric_name: str = "claude_code.cost.usage",
+    model: str = COWORK_MODEL,
+    query_source: str = COWORK_QUERY_SOURCE,
+    input_tokens: int = COWORK_INPUT_TOKENS,
+    output_tokens: int = COWORK_OUTPUT_TOKENS,
+    cost_usd: float = COWORK_COST_USD,
+    base_nano: int = COWORK_BASE_NANO,
+) -> dict:
+    """Build a Cowork-shaped ExportMetricsServiceRequest dict -- the exact
+    wire shape receiver.py's ingest_metrics_payload/_attrs/_datapoints/_common
+    parse (resourceMetrics[].resource.attributes,
+    resourceMetrics[].scopeMetrics[].metrics[].sum.dataPoints).
+
+    Parameterized so a test can swap in service_name="claude-code" (the CLI's
+    real, hyphenated value -- see billing/otel/sample_payload.py),
+    service_name=None (the attribute genuinely ABSENT from the payload, not
+    merely empty-string), or an unrecognized token_metric_name/
+    cost_metric_name -- see task 00's Requirements.
+
+    session_id defaults to COWORK_LOOKUP_SESSION_ID -- the SAME session id as
+    the seeded_otlp_db_path session that carries a session_repo_timeline row
+    -- so a downstream attribution test has something to resolve against.
+    """
+    res_attrs = []
+    if service_name is not None:
+        res_attrs.append(_cowork_kv("service.name", service_name))
+    if terminal_type is not None:
+        res_attrs.append(_cowork_kv("terminal.type", terminal_type))
+    res_attrs.append(_cowork_kv("session.id", session_id))
+    res_attrs.append(_cowork_kv("user.email", user_email))
+
+    token_dp_input = {
+        "asInt": str(input_tokens),
+        "startTimeUnixNano": str(base_nano),
+        "timeUnixNano": str(base_nano + 1),
+        "attributes": [
+            _cowork_kv("type", "input"),
+            _cowork_kv("model", model),
+            _cowork_kv("query_source", query_source),
+        ],
+    }
+    token_dp_output = {
+        "asInt": str(output_tokens),
+        "startTimeUnixNano": str(base_nano),
+        "timeUnixNano": str(base_nano + 2),
+        "attributes": [
+            _cowork_kv("type", "output"),
+            _cowork_kv("model", model),
+            _cowork_kv("query_source", query_source),
+        ],
+    }
+    cost_dp = {
+        "asDouble": cost_usd,
+        "startTimeUnixNano": str(base_nano),
+        "timeUnixNano": str(base_nano + 3),
+        "attributes": [
+            _cowork_kv("model", model),
+            _cowork_kv("query_source", query_source),
+        ],
+    }
+    return {
+        "resourceMetrics": [{
+            "resource": {"attributes": res_attrs},
+            "scopeMetrics": [{
+                "scope": {"name": "com.anthropic.claude_code"},
+                "metrics": [
+                    {
+                        "name": token_metric_name,
+                        "unit": "tokens",
+                        "sum": {"aggregationTemporality": 1, "isMonotonic": True,
+                                "dataPoints": [token_dp_input, token_dp_output]},
+                    },
+                    {
+                        "name": cost_metric_name,
+                        "unit": "USD",
+                        "sum": {"aggregationTemporality": 1, "isMonotonic": True,
+                                "dataPoints": [cost_dp]},
+                    },
+                ],
+            }],
+        }],
+    }
+
+
+@pytest.fixture
+def cowork_metrics_payload() -> dict:
+    """Default Cowork payload: service.name='cowork', terminal.type=
+    'non_interactive', session.id=COWORK_LOOKUP_SESSION_ID, user.email=
+    COWORK_USER_EMAIL, with token (input+output) and cost datapoints at
+    fixed literal values. Build a variant (different service_name, absent
+    service_name, unrecognized metric name) via build_cowork_metrics_payload
+    directly rather than this fixture."""
+    return build_cowork_metrics_payload()
+
+
+# --- golden isolation baseline capture --------------------------------------
+#
+# Mirrors tests/golden/README.md's own precedent EXACTLY: redirect_stdout,
+# open(..., newline="") on write, and the two determinism traps found in
+# Phase 3 review (freeze otel_store._now for EVERY capture; give each of the
+# three ingest_metrics_payload captures its own fresh, empty OtelStore).
+#
+# Exposed here (not only inside test_conftest.py) so a LATER task (05) can
+# `from tests.conftest import capture_cowork_isolation_baseline` and re-run
+# the identical capture against the current, possibly-changed code for its
+# replay comparison, without duplicating this logic.
+
+_ISOLATION_NOW_LITERAL = "2026-01-01T00:00:00Z"
+
+
+def _format_ingest_result(label: str, payload: dict, db_path: str) -> str:
+    """Run ingest_metrics_payload against a FRESH, empty OtelStore at
+    db_path and format its result deterministically (sorted keys). Raises
+    loudly (AssertionError) if the capture doesn't show a genuine insert on
+    both counts -- see task 00's Requirements: a duplicate/zero capture here
+    is a fixture bug, not a valid baseline."""
+    store = _otel_store.OtelStore(db_path)
+    try:
+        result = _receiver.ingest_metrics_payload(payload, store)
+    finally:
+        store.close()
+    assert result["token_inserted"] > 0, (
+        f"{label}: token_inserted must be > 0 for a fresh store, got {result!r}")
+    assert result["cost_inserted"] > 0, (
+        f"{label}: cost_inserted must be > 0 for a fresh store, got {result!r}")
+    assert result.get("duplicate", 0) == 0, (
+        f"{label}: a fresh store must never report a duplicate, got {result!r}")
+    body = json.dumps(result, sort_keys=True)
+    return f"--- {label} ---\n{body}\n"
+
+
+class _FakeAnalyticsClient:
+    """Deterministic stand-in for billing.analytics_client.AnalyticsClient --
+    never makes a live network call. usage_report yields nothing, so the
+    Analytics 'truth' side of reconcile.py's funnel is all zeros -- fixed and
+    reproducible, which is all this baseline needs (the isolation claim is
+    about the OTEL/otel_store side of the pipeline, not about matching a real
+    Analytics account)."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def usage_report(self, start, end, bucket_width="1d", group_by=None,
+                     products=None, limit=None):
+        return iter(())
+
+
+def capture_cowork_isolation_baseline(base_dir: Path, monkeypatch) -> str:
+    """Capture the CURRENT, unmodified claude_code pipeline's behavior:
+    bill.run() stdout, reconcile.run() stdout (Analytics mocked), and three
+    ingest_metrics_payload() results (claude-code / absent / cowork
+    service.name) -- each of the three against its OWN fresh OtelStore.
+    `base_dir` must be a fresh directory (e.g. a tmp_path) so repeated calls
+    never share a database file.
+
+    `otel_store._now` is frozen for the ENTIRE capture -- both determinism
+    traps from Phase 3 review -- via `monkeypatch`. Callers pass a pytest
+    `monkeypatch` fixture, or a standalone `pytest.MonkeyPatch()` instance
+    (caller's responsibility to `.undo()` it), so this can be called from
+    both a pytest test and one-off generation code identically.
+    """
+    monkeypatch.setattr(_otel_store, "_now", lambda: _ISOLATION_NOW_LITERAL)
+
+    sections = []
+
+    # --- 1. bill.py, against a fixture otel.db built from seed_otlp_rows --
+    bill_db = str(base_dir / "bill_otlp.db")
+    bill_store = _otel_store.OtelStore(bill_db)
+    seed_otlp_rows(bill_store)
+    bill_store.close()
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _bill.run(db=bill_db, markup=1.50, basis="actual")
+    sections.append(
+        "=== 1. billing.otel.bill.run() stdout "
+        "(pre-goal baseline, seeded-OTLP-rows fixture) ===\n" + buf.getvalue())
+
+    # --- 2. reconcile.py, AnalyticsClient mocked, same fixture db ---------
+    monkeypatch.setattr(_reconcile, "AnalyticsClient", _FakeAnalyticsClient)
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        _reconcile.run(start="2026-01-01", end="2026-01-02", db=bill_db)
+    sections.append(
+        "=== 2. billing.reconcile.run() stdout "
+        "(AnalyticsClient mocked -- no live network call) ===\n" + buf2.getvalue())
+
+    # --- 3. ingest_metrics_payload, THREE payloads, THREE fresh stores ----
+    ingest_lines = [
+        "=== 3. receiver.ingest_metrics_payload() results -- existing "
+        "receiver has NO service.name filter today ==="
+    ]
+    ingest_lines.append(_format_ingest_result(
+        'service.name="claude-code"',
+        build_cowork_metrics_payload(service_name="claude-code"),
+        str(base_dir / "ingest_claude_code.db")))
+    ingest_lines.append(_format_ingest_result(
+        "service.name absent",
+        build_cowork_metrics_payload(service_name=None),
+        str(base_dir / "ingest_absent.db")))
+    ingest_lines.append(_format_ingest_result(
+        'service.name="cowork" (accepted + stored as ordinary claude_code '
+        "usage -- existing, unmodified behavior; NOT a bug this goal fixes)",
+        build_cowork_metrics_payload(service_name="cowork"),
+        str(base_dir / "ingest_cowork.db")))
+    sections.append("\n".join(ingest_lines))
+
+    return "\n".join(sections) + "\n"

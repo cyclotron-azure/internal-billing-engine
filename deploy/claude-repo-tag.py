@@ -59,6 +59,21 @@ def git_remote(cwd: str) -> str:
         return ""
 
 
+def is_own_scratchpad(cwd: str, session_id: str) -> bool:
+    """True if `cwd` is this session's own Claude Code scratchpad directory,
+    rather than a directory the developer actually navigated to.
+
+    A tool call that reads/writes scratchpad files fires CwdChanged with the
+    scratchpad path, which sits outside any git repo -- tagging that as a real
+    repo switch would fragment an otherwise single-repo session's attribution
+    into extra 'unknown' timeline entries. Detected by the session's own id
+    appearing as a path component, which only happens for its own scratchpad
+    (created under a per-session folder keyed by session_id); recognized on
+    both '/' and '\\' separators since hooks run on Windows and POSIX alike.
+    """
+    return session_id in cwd.replace("\\", "/").split("/")
+
+
 def main() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
@@ -70,6 +85,8 @@ def main() -> int:
     event = payload.get("hook_event_name") or ""
     if not session_id or not cwd:
         return 0
+    if is_own_scratchpad(cwd, session_id):
+        return 0  # tool's own scratchpad, not a real cwd change -- skip
 
     now = datetime.now(timezone.utc)
     body = json.dumps({

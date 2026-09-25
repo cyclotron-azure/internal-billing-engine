@@ -1,0 +1,86 @@
+=== 1. billing.otel.bill.run() stdout (pre-goal baseline, seeded-OTLP-rows fixture) ===
+====================================================================
+PER-REPO BILL  (OTEL repo-attributed Claude Code usage)
+basis: ACTUAL cost from claude_code.cost.usage  x1.50 markup
+====================================================================
+
+globex-api
+--------------------------------------------------------------------
+  repos:  github.com/cyclotron/globex-api
+  tokens: 300.0K
+    claude-opus-4-8                  $   20.0000
+  cost basis                         $   20.0000
+  BILLED (x1.50)                     $   30.0000
+
+acme-web
+--------------------------------------------------------------------
+  repos:  github.com/cyclotron/acme-web
+  tokens: 380.0K
+    claude-sonnet-5                  $   10.0000
+  cost basis                         $   10.0000
+  BILLED (x1.50)                     $   15.0000
+
+unknown
+--------------------------------------------------------------------
+  repos:  unknown
+  tokens: 8.5K
+    claude-haiku-4-5                 $    5.0000
+  cost basis                         $    5.0000
+  BILLED (x1.50)                     $    7.5000
+====================================================================
+GRAND TOTAL cost basis               $   35.0000
+GRAND TOTAL billed                   $   52.5000
+
+cross-check  actual=$35.0000  rate-card=$4.1382  (rate-card is 0.12x actual)
+
+ATTRIBUTION SOURCE
+--------------------------------------------------------------------
+  timeline      380.0K   55.2%  hook timeline (mid-session switches attributed)
+  wrapper       300.0K   43.6%  wrapper launch tag only (no timeline for that session)
+  absent          8.5K    1.2%  no repo attribute at all -> session bypassed the wrapper
+
+⚠  UNATTRIBUTED usage -> 'unknown' bucket, not tied to any repo.
+   'no_remote' = ran outside a git repo (genuinely unbillable).
+   'absent'    = no repo tag arrived; the session never passed
+                 through the wrapper (non-CLI surface, or a bad
+                 install). That usage IS billable but unattributed.
+
+=== 2. billing.reconcile.run() stdout (AnalyticsClient mocked -- no live network call) ===
+============================================================================================================
+RECONCILIATION  period 2026-01-01 -> 2026-01-02  (product=claude_code)
+============================================================================================================
+
+BY TOKEN TYPE             analytics(truth)             otel captured coverage
+------------------------------------------------------------------------------------------------------------
+  input                  0               0    255.0K         255,000      n/a
+  output                 0               0    132.0K         132,000      n/a
+  cacheRead              0               0    251.0K         251,000      n/a
+  cacheCreation          0               0     50.5K          50,500      n/a
+------------------------------------------------------------------------------------------------------------
+  TOTAL                  0               0    688.5K         688,500      n/a
+
+COVERAGE FUNNEL (total tokens)
+------------------------------------------------------------------------------------------------------------
+  Analytics truth (org claude_code)            0               0   100.00%
+  OTEL captured                           688.5K         688,500       n/a
+    gap -688500 (-688,500) not received
+    of which repo-tagged (billable)       680.0K         680,000       n/a
+    gap 8.5K (8,500) received, no repo
+
+BILLABLE COVERAGE = repo-tagged / truth = n/a
+
+DEDUPE DROPS
+------------------------------------------------------------------------------------------------------------
+Counting began during this window, at 2026-01-01T00:00:00Z -- no duplicate datapoints were recorded from
+that instant onward, and any earlier in this window were never counted.
+
+=== 3. receiver.ingest_metrics_payload() results -- existing receiver has NO service.name filter today ===
+--- service.name="claude-code" ---
+{"cost_inserted": 1, "duplicate": 0, "inserted": 3, "metrics_seen": ["claude_code.cost.usage", "claude_code.token.usage"], "token_inserted": 2}
+
+--- service.name absent ---
+{"cost_inserted": 1, "duplicate": 0, "inserted": 3, "metrics_seen": ["claude_code.cost.usage", "claude_code.token.usage"], "token_inserted": 2}
+
+--- service.name="cowork" (accepted + stored as ordinary claude_code usage -- existing, unmodified behavior; NOT a bug this goal fixes) ---
+{"cost_inserted": 1, "duplicate": 0, "inserted": 3, "metrics_seen": ["claude_code.cost.usage", "claude_code.token.usage"], "token_inserted": 2}
+

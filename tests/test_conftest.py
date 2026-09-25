@@ -15,11 +15,22 @@ from __future__ import annotations
 import glob
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
+from billing.otel.otel_store import OtelStore
+from billing.otel.receiver import _attrs, _datapoints
+
 from tests.conftest import (
     AGENT_1_ID,
+    COWORK_COST_USD,
+    COWORK_INPUT_TOKENS,
+    COWORK_LOOKUP_SESSION_ID,
+    COWORK_OUTPUT_TOKENS,
+    COWORK_SERVICE_NAME,
+    COWORK_TERMINAL_TYPE,
+    COWORK_USER_EMAIL,
     DUPLICATE_CACHE_CREATION,
     DUPLICATE_CACHE_READ,
     DUPLICATE_INPUT,
@@ -42,7 +53,12 @@ from tests.conftest import (
     MULTI_BLOCK_REQUEST_ID,
     DUPLICATE_REQUEST_ID,
     SESSION_A_ID,
+    build_cowork_metrics_payload,
+    capture_cowork_isolation_baseline,
 )
+
+GOLDEN_DIR = Path(__file__).parent / "golden"
+COWORK_BASELINE_PATH = GOLDEN_DIR / "cowork_isolation_baseline.txt"
 
 # The 8 tables the pre-change schema defines, per otel_store.py lines 19-122.
 LEGACY_TABLES = {
@@ -482,3 +498,242 @@ def test_seeded_otlp_db_path_has_expected_row_counts(seeded_otlp_db_path):
     assert distinct_sessions == 3
     # Exactly one seeded session carries a session_repo_timeline entry.
     assert timeline_rows == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 00 (cowork-telemetry-ingest goal) -- fixtures for the new Cowork
+# ingestion pipeline, and the pre-goal golden isolation baseline capture.
+# ---------------------------------------------------------------------------
+
+def test_cowork_db_path_is_under_tmp_path_and_distinct_from_other_db_fixtures(
+    cowork_db_path, tmp_path, tmp_db_path,
+):
+    p = Path(cowork_db_path)
+    assert p.parent == tmp_path
+    assert not p.exists()
+    assert "data" not in p.parts
+    assert cowork_db_path != tmp_db_path
+
+
+def test_seeded_otlp_db_path_doubles_as_the_cowork_lookup_fixture(seeded_otlp_db_path):
+    """Task 00's 'read-only-lookup fixture' requirement: a session that
+    carries BOTH a session_repo_timeline row and a matching
+    token_usage/cost_usage row for the SAME session_id. seeded_otlp_db_path
+    already satisfies this (SEEDED_SESSIONS[0], re-exported as
+    COWORK_LOOKUP_SESSION_ID) -- no parallel fixture is built for it."""
+    conn = sqlite3.connect(seeded_otlp_db_path)
+    try:
+        timeline_rows = conn.execute(
+            "SELECT COUNT(*) FROM session_repo_timeline WHERE session_id=?",
+            (COWORK_LOOKUP_SESSION_ID,),
+        ).fetchone()[0]
+        token_rows = conn.execute(
+            "SELECT COUNT(*) FROM token_usage WHERE session_id=?",
+            (COWORK_LOOKUP_SESSION_ID,),
+        ).fetchone()[0]
+        cost_rows = conn.execute(
+            "SELECT COUNT(*) FROM cost_usage WHERE session_id=?",
+            (COWORK_LOOKUP_SESSION_ID,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert timeline_rows >= 1
+    assert token_rows >= 1
+    assert cost_rows >= 1
+
+
+def test_seeded_otlp_db_path_schema_matches_current_otel_store_schema_exactly(
+    seeded_otlp_db_path, tmp_path,
+):
+    """AC2: the existing-otel.db fixture's schema matches otel_store.py's
+    real SCHEMA exactly -- built by importing/executing it (OtelStore(path)
+    runs the real, current SCHEMA), never hand-copied. Verified by comparing
+    PRAGMA table_info across every table against an INDEPENDENTLY built
+    fresh OtelStore, not merely asserting the fixture is internally
+    consistent with itself."""
+    fresh = OtelStore(str(tmp_path / "fresh_for_schema_check.db"))
+    try:
+        conn = sqlite3.connect(seeded_otlp_db_path)
+        try:
+            fixture_tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            fresh_tables = {
+                row[0] for row in fresh.db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            assert fixture_tables == fresh_tables
+            assert fixture_tables  # sanity: not comparing two empty sets
+            for table in sorted(fixture_tables):
+                # `conn` is a plain sqlite3 connection (tuples); `fresh.db` is
+                # an OtelStore connection with row_factory=sqlite3.Row --
+                # normalize both to plain tuples before comparing, since
+                # sqlite3.Row does not compare equal to a plain tuple.
+                fixture_cols = [
+                    tuple(row) for row in
+                    conn.execute(f"PRAGMA table_info({table})").fetchall()
+                ]
+                fresh_cols = [
+                    tuple(row) for row in
+                    fresh.db.execute(f"PRAGMA table_info({table})").fetchall()
+                ]
+                assert fixture_cols == fresh_cols, (
+                    f"table_info({table}) diverged between the fixture db "
+                    f"and a freshly-built OtelStore")
+        finally:
+            conn.close()
+    finally:
+        fresh.close()
+
+
+def test_cowork_metrics_payload_attrs_and_datapoints_are_exact(cowork_metrics_payload):
+    """AC3: run the fixture through receiver.py's OWN _attrs/_datapoints
+    helpers and assert EXACT values -- proving this is a realistic,
+    correctly-shaped OTLP payload, not merely that parsing didn't crash."""
+    rm = cowork_metrics_payload["resourceMetrics"][0]
+    resource_attrs = _attrs(rm["resource"]["attributes"])
+    assert resource_attrs == {
+        "service.name": COWORK_SERVICE_NAME,
+        "terminal.type": COWORK_TERMINAL_TYPE,
+        "session.id": COWORK_LOOKUP_SESSION_ID,
+        "user.email": COWORK_USER_EMAIL,
+    }
+
+    metrics = rm["scopeMetrics"][0]["metrics"]
+    token_metric = next(m for m in metrics if m["name"] == "claude_code.token.usage")
+    cost_metric = next(m for m in metrics if m["name"] == "claude_code.cost.usage")
+
+    token_dps = _datapoints(token_metric)
+    assert len(token_dps) == 2
+    by_type = {
+        _attrs(dp["attributes"])["type"]: int(dp["asInt"]) for dp in token_dps
+    }
+    assert by_type == {"input": COWORK_INPUT_TOKENS, "output": COWORK_OUTPUT_TOKENS}
+
+    cost_dps = _datapoints(cost_metric)
+    assert len(cost_dps) == 1
+    assert cost_dps[0]["asDouble"] == COWORK_COST_USD
+
+
+@pytest.mark.parametrize("service_name", ["claude-code", None, "some-unrecognized-value"])
+def test_cowork_payload_service_name_is_swappable(service_name):
+    payload = build_cowork_metrics_payload(service_name=service_name)
+    resource_attrs = _attrs(payload["resourceMetrics"][0]["resource"]["attributes"])
+    if service_name is None:
+        assert "service.name" not in resource_attrs
+    else:
+        assert resource_attrs["service.name"] == service_name
+    # Swapping service_name never disturbs the rest of the payload's shape.
+    assert resource_attrs["session.id"] == COWORK_LOOKUP_SESSION_ID
+    assert resource_attrs["user.email"] == COWORK_USER_EMAIL
+
+
+def test_cowork_payload_unrecognized_metric_name_is_swappable():
+    payload = build_cowork_metrics_payload(
+        token_metric_name="claude_code.some.unknown.metric")
+    names = {
+        m["name"] for m in payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+    }
+    assert "claude_code.some.unknown.metric" in names
+    assert "claude_code.token.usage" not in names
+    # The cost metric is untouched by this swap.
+    assert "claude_code.cost.usage" in names
+
+
+# ---------------------------------------------------------------------------
+# AC4/AC5/AC6 -- the golden isolation baseline itself.
+# ---------------------------------------------------------------------------
+
+def test_golden_baseline_file_is_non_empty_lf_only_and_has_all_three_pieces():
+    raw = COWORK_BASELINE_PATH.read_bytes()
+    assert raw, "cowork_isolation_baseline.txt must not be empty"
+    assert b"\r\n" not in raw, "cowork_isolation_baseline.txt must be LF-only"
+
+    text = raw.decode("utf-8")
+    assert "billing.otel.bill.run()" in text
+    assert "billing.reconcile.run()" in text
+    assert "AnalyticsClient mocked" in text
+    assert "ingest_metrics_payload" in text
+    assert 'service.name="claude-code"' in text
+    assert "service.name absent" in text
+    assert 'service.name="cowork"' in text
+    # AC6: every one of the three ingest captures shows a genuine insert on
+    # both counts, never a duplicate.
+    assert text.count('"duplicate": 0') == 3
+    assert text.count('"token_inserted": 2') == 3
+    assert text.count('"cost_inserted": 1') == 3
+
+
+def test_golden_baseline_shows_cowork_payload_accepted_as_ordinary_usage():
+    """The specific fact piece 3 exists to record: the existing receiver has
+    no service.name filter, so a 'cowork'-tagged payload is stored exactly
+    like the 'claude-code' and absent-service.name variants -- all three
+    lines carry an identical result body."""
+    with open(COWORK_BASELINE_PATH, encoding="utf-8", newline="") as f:
+        text = f.read()
+    lines = text.splitlines()
+
+    def _result_after(marker: str) -> str:
+        for i, line in enumerate(lines):
+            if marker in line:
+                return lines[i + 1]
+        raise AssertionError(f"marker not found: {marker}")
+
+    claude_code_result = _result_after('service.name="claude-code"')
+    absent_result = _result_after("service.name absent")
+    cowork_result = _result_after('service.name="cowork"')
+
+    assert claude_code_result == absent_result == cowork_result
+    assert '"token_inserted": 2' in cowork_result
+    assert '"cost_inserted": 1' in cowork_result
+    assert '"duplicate": 0' in cowork_result
+
+
+def test_golden_baseline_capture_is_deterministic_across_two_fresh_runs(tmp_path):
+    """AC5: re-running the entire capture twice, in two separate temp
+    directories (two separate fresh db builds from the same fixtures,
+    otel_store._now frozen the same way both times), produces byte-identical
+    output.
+
+    Both calls happen in THIS interpreter process, back to back -- this test
+    pins same-process determinism only. It does not by itself guard against
+    cross-process or cross-run drift (e.g. a hidden dependency on process
+    startup state, import order, or hash randomization seeds); that guarantee
+    comes from test_golden_baseline_capture_matches_the_committed_file below,
+    which regenerates the capture in a fresh call and diffs it against the
+    file committed from a prior, separate run.
+
+    Each call gets its OWN MonkeyPatch instance, fully undone before the
+    next call starts (not both undone together at the end) -- undoing mp1
+    only after mp2 has already run would make mp2's setattr capture mp1's
+    still-patched value as "the original", and undoing mp2 afterwards would
+    then re-apply that patched value permanently, leaking a fake
+    AnalyticsClient/_now into every later test in the session."""
+    mp1 = pytest.MonkeyPatch()
+    try:
+        run1 = capture_cowork_isolation_baseline(tmp_path / "run1", mp1)
+    finally:
+        mp1.undo()
+
+    mp2 = pytest.MonkeyPatch()
+    try:
+        run2 = capture_cowork_isolation_baseline(tmp_path / "run2", mp2)
+    finally:
+        mp2.undo()
+
+    assert run1 == run2
+
+
+def test_golden_baseline_capture_matches_the_committed_file(tmp_path):
+    """The committed golden file is exactly what capture_cowork_isolation_baseline
+    produces today -- i.e. it was captured with this exact function, not
+    hand-edited or produced by a diverged one-off script."""
+    mp = pytest.MonkeyPatch()
+    try:
+        regenerated = capture_cowork_isolation_baseline(tmp_path / "regen", mp)
+    finally:
+        mp.undo()
+    with open(COWORK_BASELINE_PATH, encoding="utf-8", newline="") as f:
+        committed = f.read()
+    assert regenerated == committed
