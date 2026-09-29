@@ -1,0 +1,1 @@
+(Condensed evaluator report, claude-opus-5-5.) Task 01: PASS (with notes), 4/5. All reqs and ACs 1-8 independently verified, incl. N=0 print, HEAD-vs-now key parity, CLI with .env. Notes: excluded_groups keyed on raw model; _print_excluded re-reads env; globals() shadow smell; .env.example mixed EOLs; log #02 writes claim should read billing/otel/export.py, .env.example.

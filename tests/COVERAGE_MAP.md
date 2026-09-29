@@ -444,3 +444,33 @@ the two new columns plus absence of every seeded full path from both CSVs
 | 1. `python -m pytest tests/test_project_label.py tests/test_export_unattributed.py -q` passes | Property of that command's run (241 passed at authoring time). |
 | 2. Each requirement covered by a named test; map lists every task 01–03 criterion | This section, plus `pytest --collect-only -q` on the two files. |
 | 3. Neighbouring suite still passes (`test_export.py`, `test_attribute.py`, `test_invoice.py`) | Property of that command's run (25 passed at authoring time). |
+
+---
+
+# Coverage map: `lake-work-email-filter`
+
+All node ids are in `tests/test_export_email_filter.py`.
+
+## Task 01 — `01-export-domain-filter.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. gmail row absent from both CSVs; cyclotron row present | `test_both_csvs_exclude_personal_and_lookalikes_keep_cyclotron`, `test_main_no_enqueue_writes_filtered_csvs_and_prints_line`, `test_subprocess_default_without_dotenv_excludes_personal`, `test_kept_rows_equal_store_without_personal_rows` |
+| 2. `unknown`/NULL user rows retained | `test_unknown_null_and_empty_users_retained_as_unknown`, `test_is_allowed_user_keeps_missing_and_unknown`, `test_kept_key_is_raw_email_not_case_coalesced`, `test_filter_does_not_change_attribution_of_kept_rows` |
+| 3. `x@cyclotron.com.au`, `x@evil.cyclotron.com`, `cyclotron.com@gmail.com` excluded; `Y@CYCLOTRON.COM` kept | `test_is_allowed_user_excludes_personal_lookalike_and_no_at`, `test_is_allowed_user_keeps_allowed_domain_case_insensitive`, `test_is_allowed_user_uses_domain_after_last_at`, `test_both_csvs_exclude_personal_and_lookalikes_keep_cyclotron` |
+| 4. `ALLOWED_EMAIL_DOMAINS` honored, read at call time | `test_allowed_domains_default_when_unset`, `test_allowed_domains_blank_or_empty_falls_back_to_default`, `test_allowed_domains_parses_strips_lowers_and_drops_at`, `test_allowed_domains_read_at_call_time`, `test_env_override_multiple_domains_call_time`, `test_blank_env_uses_default`, `test_explicit_allowed_domains_argument_overrides_env`, `test_is_allowed_user_multiple_domains` |
+| 5. `build(stats=)` fills `excluded_groups` (distinct groups, once across tables) and `excluded_domains`; kept keys unchanged | `test_stats_counts_distinct_groups_once_across_tables`, `test_stats_never_contains_full_emails`, `test_stats_zero_when_nothing_excluded`, `test_stats_no_at_address_excluded_but_adds_no_domain`, `test_stats_group_counts_raw_email_case_variants_separately`, `test_stats_group_split_by_day_and_repo`, `test_build_without_stats_still_returns_rows`, `test_kept_key_is_raw_email_not_case_coalesced` |
+| 6. `build_and_enqueue` prints the excluded line (also N = 0) and returns `(ns, nl)` | `test_build_and_enqueue_prints_excluded_line_and_returns_counts`, `test_build_and_enqueue_prints_zero_line_when_nothing_excluded`, `test_build_and_enqueue_line_lists_configured_domains`, `test_build_and_enqueue_line_surfaces_typo_domain`, `test_build_and_enqueue_enqueues_both_tables` |
+| 7. `python -m billing.otel.export --no-enqueue` in a temp cwd with a `.env` honors it and prints the line | `test_subprocess_no_enqueue_honors_dotenv_and_prints_line`, `test_subprocess_enqueue_path_prints_line`, `test_subprocess_process_env_beats_dotenv`, `test_main_honors_dotenv_written_in_tmp_cwd`, `test_main_real_environment_beats_dotenv`, `test_main_enqueue_path_prints_line_once` |
+| 8. Existing export tests still pass | Property of `python -m pytest -q tests/test_export.py tests/test_export_unattributed.py`. |
+
+Goal criterion "raw store usage tables unchanged by export": `test_raw_tables_unchanged_by_export`
+(row dumps and counts of `token_usage`, `cost_usage`, `session_repo_timeline`).
+
+## Task 02 — `02-tests.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. New tests pass | Property of `python -m pytest -q tests/test_export_email_filter.py` (56 passed at authoring time). |
+| 2. Each task-01 criterion maps to a named test | The Task 01 table above. |
+| 3. Full suite passes | Property of `python -m pytest -q`, run by the orchestrator at cycle end. |

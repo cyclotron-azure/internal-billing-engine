@@ -1,0 +1,3 @@
+Resume note: evaluator agent ab3f1604fd6b91d62. Task 03 (readme, eval_depth light) evaluation.
+Read: _goals/lake-work-email-filter/03-readme.md, spawns/05-report.md, .claude/skills/task-criteria/SKILL.md, `git diff -- README.md`, billing/otel/export.py, billing/otel/scheduler.py (confirm the scheduler loads .env and what it prints), .env.example.
+Verify every README claim against the code (do not trust the report), ACs 1-3, that unrelated README lines are untouched, and that only README.md changed for this task (tests/ files may be in flux from task 02 running concurrently — ignore them). Read-only. Verdict PASS / PASS (with notes) / NEEDS FIXES / REJECT, same format, with Footprint.

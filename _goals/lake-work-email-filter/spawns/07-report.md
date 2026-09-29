@@ -1,0 +1,1 @@
+(Condensed implementer report, claude-sonnet-5-5.) Fix cycle 1 applied: README ~348-349, ~426-431, ~432-436, ~716-719; grep for other equality claims found none. Cumulative README diff 35 ins / 4 del. No tests run (docs only).

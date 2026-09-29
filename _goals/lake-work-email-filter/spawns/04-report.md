@@ -1,0 +1,1 @@
+(Condensed test-writer report, claude-sonnet-5.) Task 02: tests/test_export_email_filter.py (56 tests) + COVERAGE_MAP section appended. 56 passed; with existing export tests 93 passed. Isolation per spec (subprocess cwd=tmp_path, PYTHONPATH, whitelisted env; in-process chdir + _LOADED reset). No mutation check run. No product defects found.

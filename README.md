@@ -164,7 +164,7 @@ Shared:
 
 **Data-lake sync (asynchronous):**
 - **`fabric_client.py`** — uploads a file to **ADLS Gen2** (or **OneLake**) via the ADLS Gen2 DFS REST API; Entra service-principal / managed-identity / SAS auth (stdlib only). Idempotent overwrite (create → append → flush).
-- **`export.py`** — builds the two **running, all-history** lake tables (`claudeusagesummary`, `claudeusagelineitems`) from the store: flat single CSVs (no date-partition folders) with the usage month + `generated_at` as columns, regenerated in full each sync. Each table ends with two diagnostic columns, `attribution_source` and `unattributed_project`, filled only on `unknown` rows; those rows are additionally grained by the two columns, attributed rows keep their grain. Groups that collapse onto one row after model normalization or user-email coalescing are summed.
+- **`export.py`** — builds the two **running, all-history** lake tables (`claudeusagesummary`, `claudeusagelineitems`) from the store: flat single CSVs (no date-partition folders) with the usage month + `generated_at` as columns, regenerated in full each sync. Each table ends with two diagnostic columns, `attribution_source` and `unattributed_project`, filled only on `unknown` rows; those rows are additionally grained by the two columns, attributed rows keep their grain. Groups that collapse onto one row after model normalization or user-email coalescing are summed. Only usage from work-domain users is exported: rows whose `user_email` is outside `ALLOWED_EMAIL_DOMAINS` (default `cyclotron.com`) are dropped at build time, while the raw store and `bill`/`reconcile` stay unfiltered (see the lake section below).
 - **`fabric_sync.py`** — drains the delivery outbox: ships queued CSVs with retry/backoff. `python -m billing.otel.fabric_sync` (run-once; `--watch`, `--status`, `--dry-run`).
 - **`scheduler.py`** — the periodic sync job: regenerate the current month (month-to-date) and ship it, at the cadence in `SYNC_FREQUENCY` (hourly/daily/weekly/monthly). `python -m billing.otel.scheduler` (once; `--loop`, `--emit-cron`, `--month` backfill).
 
@@ -277,6 +277,8 @@ queryable Delta tables inside Microsoft Fabric.
     `CLAUDE_BILLING_TOKEN`). Generate with `openssl rand -hex 32`. **Blank means
     the receiver runs open** — see the rollout order in `deploy/README.md`.
   - `SYNC_*` / `ADLS_*` / `ONELAKE_*` / `AZURE_*` — the data-lake target and auth.
+  - `ALLOWED_EMAIL_DOMAINS` — optional; comma-separated email domains whose usage
+    is exported to the lake (default `cyclotron.com`). See "Work-domain filter" below.
 - **`repo_name_map.csv`** — optional repo→billing-name overrides (editable working file; only needed to rename or group repos).
 
 ## Typical OTEL flow
@@ -333,6 +335,27 @@ fabric_sync → drains the outbox → uploads to ADLS Gen2 / OneLake (retry + ba
 - **Config:** set the target + auth in `.env` (see `.env.example` — `SYNC_TARGET`,
   `ADLS_*`/`ONELAKE_*`, `AZURE_*`). Unset → invoices are written locally only.
 - **Runs where `otel.db` lives** (the receiver host); SQLite is single-host.
+
+### Work-domain filter
+
+Only work-domain usage reaches the lake. `export.build` drops every row whose
+`user_email` is a real address outside `ALLOWED_EMAIL_DOMAINS` (comma-separated,
+default `cyclotron.com`; set it in `.env`, read at call time).
+
+- **Match rule:** case-insensitive, exact match on the domain after the last `@`
+  (whitespace and a leading `@` on an entry are tolerated). `x@cyclotron.com.au`,
+  `x@evil.cyclotron.com` and `cyclotron.com@gmail.com` are excluded.
+- **Kept:** rows with a NULL/empty user (exported as `unknown`); rows whose user is
+  whitespace-only or the literal `unknown` in any case (kept, exported as stored);
+  and rows for allowed-domain users, all unchanged.
+- **Unfiltered elsewhere:** the filter runs at export only. The raw store
+  (`token_usage`, `cost_usage`, `session_repo_timeline`) keeps everything, and
+  `bill`, `reconcile` and `invoice` are unaffected.
+- **Reporting:** every export run prints `[export] excluded N group(s) outside <domains>`,
+  including when N is 0. This covers the scheduler (via `build_and_enqueue`) and
+  `python -m billing.otel.export`, with or without `--no-enqueue`. N counts distinct
+  excluded (day, repo, model, user) groups. The scheduler already loads `.env`; the
+  export CLI now does too, so a `.env` `ALLOWED_EMAIL_DOMAINS` applies to it.
 
 ### Unattributed usage in the lake tables
 
@@ -403,8 +426,15 @@ another repo by absolute path.
   real repo whose bill name happens to be `unknown` stays unsplit with a blank class.
 - Collision correction: the export now sums usage that collapses onto one row after
   model normalization (`[1m]`, dated snapshots) or user-email coalescing, where it
-  previously kept only one group. Totals now match `invoice.py`, and some
-  historical Fabric totals rise on the next sync.
+  previously kept only one group. Totals for exported (allowed-domain and `unknown`)
+  usage now match `invoice.py` (lake totals are lower than `invoice.py` by the
+  excluded personal-domain usage, see below), and some historical Fabric totals
+  rise on the next sync.
+- Work-domain filter: the tables are overwritten in full, so the first sync after
+  the filter ships removes personal-domain rows from ALL history, and past-month
+  lake totals may drop. Local `bill`/`reconcile`/`invoice.py` figures do not change,
+  so lake totals are expected to sit below `invoice.py` totals by exactly the
+  excluded personal-domain usage.
 
 ---
 
@@ -685,7 +715,9 @@ engine and the Fabric notebook can disagree.
    month reproduces the original numbers. Also add validation on ingest: one
    client per repo, no blank clients, no duplicate repo keys.
 4. **Reconcile Fabric totals against `otel.db`.** Two aggregation paths now exist
-   (`invoice.py` locally, the notebook in Fabric). Assert per-month totals match;
+   (`invoice.py` locally, the notebook in Fabric). Assert per-month totals match
+   after restricting `invoice.py` totals to allowed-domain and `unknown` users
+   (unrestricted, the lake is lower by exactly the excluded personal-domain usage);
    a silent divergence means one of them is wrong and you won't know which.
 5. **Real rates.** `rating.py` rates are placeholders. Billing runs off actual
    reported cost so this mainly affects the cross-check — but a cross-check

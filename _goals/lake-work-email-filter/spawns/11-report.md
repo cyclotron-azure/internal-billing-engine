@@ -1,0 +1,1 @@
+(Condensed evaluator report, claude-opus-5-5.) Phase 5 audit: APPROVED (PASS with notes) 4.5/5. Scheduler path verified to print excluded line; all 7 success criteria and CLAUDE.md constraints hold; full suite 1006 passed. Minor notes: mixed EOLs, _print_excluded re-reads env, globals() shadow, raw-model group count.

@@ -1,0 +1,1 @@
+(Condensed implementer report, claude-sonnet-5-5.) Task 03: README edited (26 ins, 1 del): export.py bullet ~167, ALLOWED_EMAIL_DOMAINS bullet in env list ~280, new 'Work-domain filter' subsection ~340, Power BI owners bullet. Did not verify scheduler loads .env (taken from brief). porcelain diff: only README.md new.

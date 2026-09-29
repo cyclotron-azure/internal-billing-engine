@@ -22,6 +22,13 @@ diagnostic only -- never part of `repo` / `repo_key`.
 Regenerated in full from the store on every sync and written to a STABLE path, so
 Fabric can load-to-table with OVERWRITE and always get the complete,
 de-duplicated history.
+
+Work-domain filter: datapoints whose user_email is a real address outside the
+allowed domain set (env ALLOWED_EMAIL_DOMAINS, comma-separated, default
+cyclotron.com; read at call time) are dropped before aggregation, so neither CSV
+carries personal-account usage. Match is case-insensitive on the exact domain
+after the last '@'. Missing/`unknown` users are kept. The raw store is untouched;
+each export prints how many groups were excluded.
 """
 
 from __future__ import annotations
@@ -60,9 +67,49 @@ def _month_end(ym: str) -> str:
     return date(y + m // 12, m % 12 + 1, 1).isoformat()
 
 
-def build(store: OtelStore, markup: float):
-    """Return (summary_rows, line_rows) covering ALL usage in the store,
-    aggregated per usage DAY × repo/model × user."""
+DEFAULT_ALLOWED_DOMAINS = ("cyclotron.com",)
+
+
+def allowed_domains() -> tuple:
+    """Allowed work-email domains, read from ALLOWED_EMAIL_DOMAINS at CALL time.
+
+    Comma-separated; entries are stripped, lower-cased, and a leading '@' is
+    dropped. Unset or effectively empty -> DEFAULT_ALLOWED_DOMAINS."""
+    raw = os.environ.get("ALLOWED_EMAIL_DOMAINS") or ""
+    doms = tuple(d for d in (p.strip().lower().lstrip("@").strip()
+                             for p in raw.split(",")) if d)
+    return doms or DEFAULT_ALLOWED_DOMAINS
+
+
+def is_allowed_user(email, domains) -> bool:
+    """True if a datapoint with this user_email belongs in the lake.
+
+    NULL/empty/whitespace-only and the literal 'unknown' are kept. Otherwise the
+    domain after the LAST '@' must exactly equal an allowed domain; an address
+    with no '@' is excluded."""
+    if email is None:
+        return True
+    e = str(email).strip().lower()
+    if not e or e == UNKNOWN_USER:
+        return True
+    if "@" not in e:
+        return False
+    return e.rsplit("@", 1)[1] in domains
+
+
+def build(store: OtelStore, markup: float, allowed_domains=None, stats=None):
+    """Return (summary_rows, line_rows) covering the store's usage for allowed
+    users, aggregated per usage DAY × repo/model × user.
+
+    Datapoints whose user_email is a real address outside `allowed_domains`
+    (default: ALLOWED_EMAIL_DOMAINS / cyclotron.com) are dropped before keying.
+    If `stats` is a dict it receives `excluded_groups` (distinct excluded
+    (day, repo, model, user_email) groups) and `excluded_domains` (sorted
+    dropped domains, never full emails)."""
+    if allowed_domains is None:
+        allowed_domains = globals()["allowed_domains"]()
+    excluded_groups: set = set()
+    excluded_domains: set = set()
     mapping = store.get_mapping()
     name_of = lambda repo: mapping.get(repo) or repo_name(repo)
 
@@ -92,6 +139,12 @@ def build(store: OtelStore, markup: float):
                 "CASE WHEN resolved_repo = 'unknown' THEN session_id END sid, "
                 f"{agg} v, MIN(ts) lo, MAX(ts) hi "
                 "FROM r GROUP BY d, resolved_repo, model, user_email, src, sid"):
+            if not is_allowed_user(r["user_email"], allowed_domains):
+                excluded_groups.add((r["d"], r["resolved_repo"], r["model"], r["user_email"]))
+                addr = str(r["user_email"]).strip().lower()
+                if "@" in addr:
+                    excluded_domains.add(addr.rsplit("@", 1)[1])
+                continue
             unknown = r["resolved_repo"] == "unknown"
             key = (r["d"], r["resolved_repo"], normalize_model(r["model"]),
                    r["user_email"] or UNKNOWN_USER,
@@ -142,6 +195,9 @@ def build(store: OtelStore, markup: float):
             "total_billed_usd": round(c * markup, 6),
             "first_usage_at_utc": lo, "last_usage_at_utc": hi, "generated_at": gen,
             "attribution_source": src, "unattributed_project": label})
+    if stats is not None:
+        stats["excluded_groups"] = len(excluded_groups)
+        stats["excluded_domains"] = sorted(excluded_domains)
     return summary_rows, line_rows
 
 
@@ -152,11 +208,19 @@ def _write_csv(path: str, fields: list, rows: list) -> None:
         w.writerows(rows)
 
 
+def _print_excluded(stats: dict) -> None:
+    """One line: how many groups the domain filter dropped (domains only)."""
+    print(f"[export] excluded {stats.get('excluded_groups', 0)} group(s) outside "
+          f"{','.join(allowed_domains())}")
+
+
 def build_and_enqueue(store: OtelStore, markup: float, out_dir: str = "exports"):
     """Write the two running CSVs and queue them for upload to stable, flat
     paths (<prefix>/claudeusagesummary.csv, <prefix>/claudeusagelineitems.csv)."""
     os.makedirs(out_dir, exist_ok=True)
-    summary_rows, line_rows = build(store, markup)
+    stats: dict = {}
+    summary_rows, line_rows = build(store, markup, stats=stats)
+    _print_excluded(stats)
 
     sp = os.path.join(out_dir, f"{SUMMARY_TABLE}.csv")
     lp = os.path.join(out_dir, f"{LINEITEMS_TABLE}.csv")
@@ -188,9 +252,14 @@ def main():
                     help="write the CSVs but do not queue them for upload")
     args = ap.parse_args()
 
+    from ..config import load_env
+    load_env()  # honor a .env ALLOWED_EMAIL_DOMAINS (call time, not import time)
+
     store = OtelStore(args.db) if args.db else OtelStore()
     if args.no_enqueue:
-        summary_rows, line_rows = build(store, args.markup)
+        stats: dict = {}
+        summary_rows, line_rows = build(store, args.markup, stats=stats)
+        _print_excluded(stats)
         os.makedirs(args.out_dir, exist_ok=True)
         _write_csv(os.path.join(args.out_dir, f"{SUMMARY_TABLE}.csv"),
                    SUMMARY_FIELDS, summary_rows)

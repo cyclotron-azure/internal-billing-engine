@@ -1,0 +1,1 @@
+(Condensed implementer report, claude-sonnet-5-5.) Fix cycle 2: README 348-350 Kept bullet reworded (NULL/empty -> unknown; whitespace-only/any-case unknown kept as stored); ~718-721 rewrapped. No other edits.

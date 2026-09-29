@@ -1,0 +1,1 @@
+(Condensed evaluator report, claude-opus-5-5.) Task 03 re-eval: NEEDS FIXES 3.5/5. invoice.py contradictions fixed. New inaccuracy: README ~348-349 says whitespace-only and literal unknown (any case) are 'exported as unknown'; actually only NULL/'' become unknown, others exported as stored. Minor: ~717 line width.
