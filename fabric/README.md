@@ -39,8 +39,13 @@ each run, so the tables stay current with no duplicates.
 
 Two running Delta tables, queryable from the SQL endpoint / Power BI:
 
-- **`claudeusagesummary`** — `usage_date_utc, period_start, period_end, bill_name, user_email, tokens, actual_cost_usd, markup, total_billed_usd, first_usage_at_utc, last_usage_at_utc, generated_at`
-- **`claudeusagelineitems`** — `usage_date_utc, period_start, period_end, bill_name, repo, model, user_email, tokens, actual_cost_usd, billed_usd, first_usage_at_utc, last_usage_at_utc, generated_at`
+- **`claudeusagesummary`** — `usage_date_utc, period_start, period_end, repo, user_email, tokens, actual_cost_usd, markup, total_billed_usd, first_usage_at_utc, last_usage_at_utc, generated_at, attribution_source, unattributed_project`
+- **`claudeusagelineitems`** — `usage_date_utc, period_start, period_end, repo, repo_key, model, user_email, tokens, actual_cost_usd, billed_usd, first_usage_at_utc, last_usage_at_utc, generated_at, attribution_source, unattributed_project`
+
+`attribution_source` and `unattributed_project` are filled only on `repo = 'unknown'`
+rows (`unattributed_project` is also blank when the session has no timeline, always
+for `no_remote` and `absent`); see "Unattributed usage in the lake tables" in the
+top-level [`README.md`](../README.md) for what they mean.
 
 `user_email` is the employee whose Claude Code session produced the usage
 (`unknown` if the datapoint arrived without a user attribute). Both tables are

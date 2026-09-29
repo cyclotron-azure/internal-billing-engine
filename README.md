@@ -151,6 +151,7 @@ Shared:
   `python -m billing.otel.receiver` (`--host`, `--port`, `--db`, `--require-auth`)
 - **`transcript.py`** — the wire-payload contract for `POST /v1/transcript-usage`: a 14-field schema (fail-closed — an unknown field, including `cwd`, is a per-record rejection, never silently ignored), per-record validation, `MAX_BATCH_SIZE=500`, and the mapping from one validated record to its `token_usage` rows (terminal-block collapse already done client-side) plus a rate-card-costed `cost_usage` row. Pure and stdlib-only — no I/O, no store access.
 - **`attribute.py`** — resolves *which repo a datapoint bills to*, at query time. Joins the `session_repo_timeline` onto each datapoint as-of its own timestamp, so a session that moved between repos splits across them. Falls back through `desktop-scratch → timeline → absent → no_remote → wrapper` (checked in that order — `desktop-scratch` is deliberately first: a scratch desktop session still gets a timeline row, but one that carries no billable repo, so it must be claimed before the `timeline` branch would otherwise claim it), and exposes that choice as `attribution_source` so you can see which signal is carrying the bill. Resolution is derived, never stored: a late or corrected timeline retroactively fixes past bills with no re-ingest.
+- **`project_label.py`** — turns one session's stored cwd history into a privacy-safe project-root label (`local:Dashnoard`) used only to explain `unknown` usage. Derived at query time from `session_repo_timeline`, never persisted, never a repo key. Read by `export.py`; see [Unattributed usage in the lake tables](#unattributed-usage-in-the-lake-tables).
 - **`otel_store.py`** — SQLite store: deduped `token_usage` and `cost_usage` datapoints (each carrying `usage_source` — `otlp` | `transcript` — plus `token_usage.entrypoint` and `cost_usage.cost_source` — `actual` | `rate_card` — so desktop-sourced rows are distinguishable from CLI/OTLP ones), `dedupe_drops` (per-`(day, token_type, usage_source)` count of datapoints rejected as duplicates), the `session_repo_timeline`, persisted invoices + line items, the optional `repo_name_map` override table, and the `fabric_outbox` delivery queue. The counting-start epoch in `meta` is written by the insert path, not by migration, so a store opened only by a read-only consumer never acquires one — which is what lets `reconcile.py` distinguish "never counted" from "counted, zero duplicates".
 - **`normalize.py`** — collapses git remote forms (ssh vs https, `.git`, case) into one canonical repo key so a repo isn't billed twice, and derives the short repo name (`repo_name`) that is the billing identity.
 - **`repos.py`** — manage the OPTIONAL repo→billing-name override map: `export` observed repos to CSV, edit the `bill_name` column to rename/group a repo, then `import`. Not needed by default — every repo bills under its own name.
@@ -163,7 +164,7 @@ Shared:
 
 **Data-lake sync (asynchronous):**
 - **`fabric_client.py`** — uploads a file to **ADLS Gen2** (or **OneLake**) via the ADLS Gen2 DFS REST API; Entra service-principal / managed-identity / SAS auth (stdlib only). Idempotent overwrite (create → append → flush).
-- **`export.py`** — builds the two **running, all-history** lake tables (`claudeusagesummary`, `claudeusagelineitems`) from the store: flat single CSVs (no date-partition folders) with the usage month + `generated_at` as columns, regenerated in full each sync.
+- **`export.py`** — builds the two **running, all-history** lake tables (`claudeusagesummary`, `claudeusagelineitems`) from the store: flat single CSVs (no date-partition folders) with the usage month + `generated_at` as columns, regenerated in full each sync. Each table ends with two diagnostic columns, `attribution_source` and `unattributed_project`, filled only on `unknown` rows; those rows are additionally grained by the two columns, attributed rows keep their grain. Groups that collapse onto one row after model normalization or user-email coalescing are summed.
 - **`fabric_sync.py`** — drains the delivery outbox: ships queued CSVs with retry/backoff. `python -m billing.otel.fabric_sync` (run-once; `--watch`, `--status`, `--dry-run`).
 - **`scheduler.py`** — the periodic sync job: regenerate the current month (month-to-date) and ship it, at the cadence in `SYNC_FREQUENCY` (hourly/daily/weekly/monthly). `python -m billing.otel.scheduler` (once; `--loop`, `--emit-cron`, `--month` backfill).
 
@@ -302,8 +303,13 @@ fabric_sync → drains the outbox → uploads to ADLS Gen2 / OneLake (retry + ba
 
 - **The two tables** (each a single flat CSV, no date folders, so Fabric loads it
   as one running table):
-  - `claudeusagesummary.csv` — one row per (usage date, repo/bill_name, user_email)
-  - `claudeusagelineitems.csv` — one row per (usage date, repo, model, user_email)
+  - `claudeusagesummary.csv` — one row per (usage date, repo/bill_name, user_email);
+    `unknown` rows additionally split by (`attribution_source`, `unattributed_project`)
+  - `claudeusagelineitems.csv` — one row per (usage date, repo, model, user_email);
+    `unknown` rows additionally split by (`attribution_source`, `unattributed_project`)
+
+  Rows billed to a real repo keep this grain exactly, and the two new columns
+  are blank on them.
 - **Date is a column, not a folder:** each row carries `usage_date_utc` (the UTC day
   the usage happened, the finest time grain), `first_usage_at_utc` /
   `last_usage_at_utc` (the timestamps bounding that day's activity for the row —
@@ -327,6 +333,78 @@ fabric_sync → drains the outbox → uploads to ADLS Gen2 / OneLake (retry + ba
 - **Config:** set the target + auth in `.env` (see `.env.example` — `SYNC_TARGET`,
   `ADLS_*`/`ONELAKE_*`, `AZURE_*`). Unset → invoices are written locally only.
 - **Runs where `otel.db` lives** (the receiver host); SQLite is single-host.
+
+### Unattributed usage in the lake tables
+
+Both tables end with two columns that explain `repo = unknown` rows. They are
+filled only on `unknown` rows and blank on rows billed to a real repo.
+`unattributed_project` is also blank on `unknown` rows whose session has no
+timeline (always for `no_remote` and `absent`).
+
+**`attribution_source`** says why the usage is unattributed:
+
+| Value | Meaning |
+|---|---|
+| `timeline` | The repo hook fired, but the folder it reported has no git remote (a plain folder, an unzipped download, or a local repo with no `origin`). |
+| `no_remote` | No timeline rows; the launch-time wrapper tag was `unknown` because the launch directory had no git remote (a local repo with no remote counts). |
+| `absent` | No repo signal ever arrived: the hook is not installed or not firing, or the surface never ran the wrapper. |
+| `desktop-scratch` | Transcript-sourced usage (desktop app, and the cli / VS Code transcript backfill) with no billable repo. |
+
+`wrapper` is not expected on `unknown` rows: it only resolves to a real repo.
+
+**`unattributed_project`** names the project the developer was working in, as the
+root folder name only (`local:Dashnoard`). It is a hint for diagnosis, not a repo:
+it is never a repo key and never billed, and `resolved_repo`, invoices and
+`repo_name_map` are unaffected. The rule, in plain words:
+
+- One label per session, from that session's own cwd history. Cwds outside the
+  session's root still get the session's label.
+- The start of the path is the "outer zone": the home prefix (`C:\Users\<name>`,
+  `/home/<name>`, `/root`) followed by any run of outer folders (`OneDrive*`,
+  `Desktop`, `Documents`, `Downloads`, `Library`, `CloudStorage`, `Visual Studio *`)
+  and container folders (`Code`, `src`, `source`, `repos`, `projects`, `dev`, `git`,
+  `GitHub`, `workspace`). A drive (`C:`), a UNC host and share, `~`, WSL `/mnt/c/...`
+  and Git Bash `/c/...` are drive-style prefixes, stripped before the home check.
+  When that zone includes a container folder, the label is the first folder after
+  it, so `...\Code\Dashnoard` and `...\Code\Dashnoard\OfficeDashboard\backend` both
+  give `local:Dashnoard`, and `...\source\repos\proj` gives `local:proj`. Otherwise
+  the label is the session's start folder, walked up only by the two rules below (so
+  `...\Documents\foo\bar` gives `local:bar`, and
+  `C:\Cyclotron\Insights Agent\ai-presales-agent-main\ai-presales-agent-main` gives
+  `local:ai-presales-agent-main`).
+- Container folders inside a project point back to their parent
+  (`C:\Cyclotron\proj\src\components` gives `local:proj`). If the session's cwd
+  history visits a shallower folder on the same path, that folder is the root.
+- A folder directly inside the home folder is a valid label
+  (`C:\Users\<name>\orbit` gives `local:orbit`).
+- Special values: `local:(home)` when the session started in the outer zone with no
+  project folder; `local:(scratchpad)` for any Claude-internal folder (`.claude`,
+  `Temp\claude`); `local:(other)` when the folder name would still look like a path
+  or contains a path separator or `:`, starts with `.`, is a `C--` project slug,
+  contains `OneDrive` anywhere in the name, starts with `-Users-`, is a bare
+  `Users`/`home` folder, contains a control character, or is the username
+  (allowlist guard).
+- Never a full path, drive letter, `Users`/`home` or username. Derived at query time
+  from the stored timeline, so a late or corrected timeline relabels history
+  retroactively; nothing is persisted.
+
+Accepted mislabels: a session that visits a real ancestor folder outside the outer
+zone (e.g. `C:\Cyclotron`) takes that ancestor as its root, and a session that
+starts in a real repo and then works in a no-remote folder labels those `unknown`
+rows with the start folder's name. Known gaps, not fixed here: hook scratchpad
+detection for the project-slug layout, and cwd-based undercounting of work done in
+another repo by absolute path.
+
+**For Power BI / semantic-model owners:**
+
+- Row counts for `unknown` changed (one row per class and project). Sum tokens and
+  cost; don't count rows.
+- Filter unattributed usage with `repo = 'unknown' AND attribution_source <> ''`. A
+  real repo whose bill name happens to be `unknown` stays unsplit with a blank class.
+- Collision correction: the export now sums usage that collapses onto one row after
+  model normalization (`[1m]`, dated snapshots) or user-email coalescing, where it
+  previously kept only one group. Totals now match `invoice.py`, and some
+  historical Fabric totals rise on the next sync.
 
 ---
 
@@ -464,7 +542,9 @@ The pilot exists to produce numbers that cannot be estimated:
 - **Rows per developer per day** — count `token_usage` rows ÷ active devs. This is
   the input to the capacity plan below.
 - **The `unknown` rate** — flagged by `bill.py`. High means a workflow problem to
-  fix with policy, not code.
+  fix with policy, not code. The lake tables now break `unknown` down by
+  `attribution_source` and `unattributed_project`; see
+  [Unattributed usage in the lake tables](#unattributed-usage-in-the-lake-tables).
 
 **Do not start the fleet rollout until coverage is a number worth defending to a
 client.** Invoices will be built on it.
@@ -494,7 +574,8 @@ client.** Invoices will be built on it.
 6. **Capacity checkpoint.** `export.py` rebuilds all history each sync with a full
    `GROUP BY` scan. Correct, simple, and fine for year one; it degrades as raw
    datapoints accumulate. Multiply the pilot's rows/dev/day by fleet size to find
-   the date, and plan a compaction step (roll datapoints older than ~90 days into
+   the date. The `unknown` breakdown adds a per-datapoint class lookup for `unknown`
+   rows only, plus one read of the session timeline per build. Plan a compaction step (roll datapoints older than ~90 days into
    daily aggregates, prune) before the DB reaches a few GB.
 
 If Phase 0 says the fleet is large (~500+ devs), skip the SQLite hardening: put an

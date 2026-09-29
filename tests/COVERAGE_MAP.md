@@ -386,3 +386,61 @@ expected test names/negative cases are present, per this goal's context package.
 criterion 8 (the targeted five-file failure count) is a command-output property of the
 full run, not a single node id, consistent with how other command-output criteria are
 handled elsewhere in this file.
+
+---
+
+# Coverage map: `unattributed-usage-breakdown`
+
+Maps every acceptance criterion in `_goals/unattributed-usage-breakdown/01-project-label.md`,
+`02-export-breakdown.md` and `03-readme-columns.md` to the test node id(s) that verify it.
+Task 01's criteria live in `tests/test_project_label.py`; task 02's in
+`tests/test_export_unattributed.py`. Criteria verified only by command output or document
+review are listed as **GAP** with the reason. Parametrized tests are cited by function
+name; every case of the parametrization belongs to the criterion.
+
+## Task 01 — `01-project-label.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. Frozen interface, no import outside the standard library | `test_project_label.py::test_interface_constants_are_frozen` pins `LOCAL_PREFIX` / `HOME_LABEL` / `SCRATCHPAD_LABEL` / `OTHER_LABEL` / `CONTAINER_DIRS`; the four functions are exercised by name throughout the file. **GAP (partial)**: the `python -c` print and the import scan of the file are command-output checks, not tests. |
+| 2. All 38 worked examples return the stated label | `test_project_label.py::test_worked_example` (39 cases: `ex01`..`ex38`, with `ex22a` / `ex22b`), `test_project_label.py::test_all_38_worked_examples_are_present` (fails if an example id is dropped) |
+| 3. `root_label` never raises and never returns a bare `local:` for malformed inputs | `test_project_label.py::test_malformed_inputs_never_raise_and_never_return_bare_prefix` (12 inputs x 4 event names, incl. `":"`, `"\\\\"`, `" "`, `"C:"`, a 10,000-character path), `test_project_label.py::test_ten_thousand_character_path_yields_truncated_label`, `test_project_label.py::test_whitespace_only_cwd_is_empty`, `test_project_label.py::test_root_label_never_raises_on_non_string_cells` |
+| 4. Privacy: for every cwd in the worked examples the label has no `/`, `\`, extra `:`, `Users` / `home` segment, `OneDrive`, `.claude`, `C--` / `-Users-` slug, or username | `test_project_label.py::test_label_never_leaks_paths_or_identity` (every worked-example history, plus username / slug / OneDrive / malformed extras), `test_project_label.py::test_guard_is_whole_segment_not_substring` (`users-api` and `Project.Users` stay legal under the whole-segment ruling), `test_project_label.py::test_allowlist_guard` |
+| 5. `load_session_labels`: one SELECT, `{}` on empty timeline, omits empty labels | `test_project_label.py::test_load_session_labels_issues_exactly_one_select_and_no_writes` (`set_trace_callback` sees exactly one statement, no writes), `test_project_label.py::test_load_session_labels_empty_timeline_returns_empty_dict`, `test_project_label.py::test_load_session_labels_groups_sessions_and_omits_empty_labels`, `test_project_label.py::test_load_session_labels_orders_each_session_by_ts_then_seq`, `test_project_label.py::test_load_session_labels_is_recomputed_from_the_timeline_each_call` |
+
+## Task 02 — `02-export-breakdown.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. Both CSV headers end with `attribution_source, unattributed_project`; earlier headers unchanged | `test_export_unattributed.py::test_field_lists_append_the_two_new_columns_after_the_pre_change_lists`, `test_export_unattributed.py::test_csv_headers_end_with_new_columns_and_keep_earlier_order` (both against hard-coded pre-change lists), `test_export_unattributed.py::test_cli_main_no_enqueue_writes_headers_and_queues_nothing` (the `python -m billing.otel.export ... --no-enqueue` path) |
+| 2. Attributed rows match the pre-change export; unknown rows split into `timeline` / `local:Dashnoard` and `absent`-or-`no_remote` / `""` | `test_export_unattributed.py::test_attributed_line_rows_match_hard_coded_pre_change_baseline`, `test_export_unattributed.py::test_attributed_summary_rows_match_hard_coded_pre_change_baseline`, `test_export_unattributed.py::test_attributed_csv_cells_for_new_columns_are_empty_strings`, `test_export_unattributed.py::test_attributed_session_with_a_cwd_never_receives_a_label`, `test_export_unattributed.py::test_unknown_rows_split_into_one_row_per_class_and_label`, `test_export_unattributed.py::test_derek_shaped_session_and_no_timeline_session_are_separate_rows`, `test_export_unattributed.py::test_summary_unknown_rows_split_the_same_way`, `test_export_unattributed.py::test_attribution_source_comes_from_resolved_view_and_wrapper_never_appears`. The tests compare to hard-coded pre-change dicts. **GAP (partial)**: the literal `git show HEAD:billing/otel/export.py` scratch-copy diff is a one-off command-output check. |
+| 3. Token and cost per (day, model, user) equal the database, and equal the pre-change export on a collision-free store | `test_export_unattributed.py::test_split_rows_conserve_tokens_and_cost_against_the_database`, `test_export_unattributed.py::test_collision_store_export_equals_database`, `test_export_unattributed.py::test_collision_store_colliding_unknown_models_are_summed_not_overwritten`, `test_export_unattributed.py::test_collision_store_matches_invoice_per_repo_model`, `test_export_unattributed.py::test_main_store_matches_invoice_per_repo_model_including_the_split_unknown`, `test_export_unattributed.py::test_sessions_sharing_a_class_and_label_merge_into_one_row_with_combined_span`, `test_export_unattributed.py::test_span_of_each_split_row_is_min_max_of_its_own_datapoints` (the pre-change equality on the collision-free store is the hard-coded baseline tests under criterion 2) |
+| 4. 25%-unknown timing comparison within 3x (all three ratios reported) | **GAP** — a wall-clock ratio against the pre-change `build()` is a command-output measurement on a 20,000-datapoint store; a timing assertion in the suite would be flaky. The structural guarantees behind it are tested: `test_export_unattributed.py::test_build_loads_labels_once_and_scans_each_table_once`, `test_export_unattributed.py::test_build_is_read_only_single_connection` |
+| 5. Existing tests still pass (`test_export.py`, `test_attribute.py`, `test_invoice.py`) | **GAP** — a command-output property of running those three files; no node id verifies it. `test_export_unattributed.py::test_invoice_totals_are_unchanged_by_the_export` and `test_export_unattributed.py::test_invoice_billing_names_do_not_include_any_label` pin `invoice.py` output on the seeded store. |
+
+Task 02 requirements not phrased as acceptance criteria are also pinned: diagnostic isolation
+(`test_repo_name_map_override_of_a_real_repo_does_not_change_the_split`,
+`test_mapping_a_real_repo_to_the_name_unknown_stays_unsplit_with_blank_class`,
+`test_mapping_the_unknown_key_renames_the_bill_but_keeps_the_split`,
+`test_label_never_appears_in_repo_or_repo_key`), query-time recomputation
+(`test_labels_are_recomputed_at_query_time_from_the_timeline`), the collision correction
+(NULL / `""` / `"unknown"` users, `[1m]` and dated models, blank / NULL models), and privacy of
+the two new columns plus absence of every seeded full path from both CSVs
+(`test_new_columns_and_both_csvs_never_leak_paths_or_identity`,
+`test_hostile_cwds_collapse_to_safe_labels_only`). The docstring update is a review item.
+
+## Task 03 — `03-readme-columns.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. `fabric/README.md` column lists equal the field lists in `export.py`, in order | **GAP** — verified by command output (print both field lists, grep the README lines); documentation content is not asserted by a test. `test_export_unattributed.py::test_field_lists_append_the_two_new_columns_after_the_pre_change_lists` pins the code side of the comparison. |
+| 2. `README.md` names all five classes with a meaning each and the label rule with both special labels | **GAP** — doc-review / grep only. |
+| 3. No unrelated README lines changed | **GAP** — `git diff --stat` and a read of the diff; a review property, not testable. |
+
+## Task 04 — `04-tests.md`
+
+| Criterion | Test node id(s) |
+|---|---|
+| 1. `python -m pytest tests/test_project_label.py tests/test_export_unattributed.py -q` passes | Property of that command's run (241 passed at authoring time). |
+| 2. Each requirement covered by a named test; map lists every task 01–03 criterion | This section, plus `pytest --collect-only -q` on the two files. |
+| 3. Neighbouring suite still passes (`test_export.py`, `test_attribute.py`, `test_invoice.py`) | Property of that command's run (25 passed at authoring time). |

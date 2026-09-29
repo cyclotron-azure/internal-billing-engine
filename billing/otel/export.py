@@ -15,6 +15,10 @@ first_usage_at_utc / last_usage_at_utc timestamps bounding that day's activity â
 and the calendar month it bills to (period_start / period_end), so a monthly
 rollup is just a GROUP BY. All three are UTC, as emitted by Claude Code.
 generated_at is unrelated to usage: it records when the snapshot was produced.
+Rows billed to `unknown` are further split by the trailing attribution_source
+(why no repo was found) and unattributed_project (a privacy-safe project-folder
+label from the session timeline, or ""); both are "" for attributed rows and are
+diagnostic only -- never part of `repo` / `repo_key`.
 Regenerated in full from the store on every sync and written to a STABLE path, so
 Fabric can load-to-table with OVERWRITE and always get the complete,
 de-duplicated history.
@@ -29,16 +33,19 @@ from datetime import date, datetime, timezone
 from .attribute import resolved_view
 from .normalize import normalize_model, repo_name
 from .otel_store import OtelStore
+from .project_label import load_session_labels
 
 SUMMARY_TABLE = "claudeusagesummary"
 LINEITEMS_TABLE = "claudeusagelineitems"
 
 SUMMARY_FIELDS = ["usage_date_utc", "period_start", "period_end", "repo", "user_email",
                   "tokens", "actual_cost_usd", "markup", "total_billed_usd",
-                  "first_usage_at_utc", "last_usage_at_utc", "generated_at"]
+                  "first_usage_at_utc", "last_usage_at_utc", "generated_at",
+                  "attribution_source", "unattributed_project"]
 LINE_FIELDS = ["usage_date_utc", "period_start", "period_end", "repo", "repo_key", "model",
                "user_email", "tokens", "actual_cost_usd", "billed_usd",
-               "first_usage_at_utc", "last_usage_at_utc", "generated_at"]
+               "first_usage_at_utc", "last_usage_at_utc", "generated_at",
+               "attribution_source", "unattributed_project"]
 
 UNKNOWN_USER = "unknown"  # datapoints that arrived without a user.email attribute
 
@@ -73,33 +80,40 @@ def build(store: OtelStore, markup: float):
     # Repo is resolved per datapoint BEFORE the day/model/user rollup, so a
     # session that moved between repos splits into separate rows rather than
     # billing wholly to wherever it launched. See billing.otel.attribute.
+    # Rows that resolve to 'unknown' also carry their attribution class and
+    # session (mapped to a project label below); attributed rows get NULLs.
+    labels = load_session_labels(store.db)  # once per build; never persisted
+
+    def _scan(table, agg):
+        for r in store.db.execute(
+                f"WITH r AS ({resolved_view(table)}) "
+                "SELECT substr(ts,1,10) d, resolved_repo, model, user_email, "
+                "CASE WHEN resolved_repo = 'unknown' THEN attribution_source END src, "
+                "CASE WHEN resolved_repo = 'unknown' THEN session_id END sid, "
+                f"{agg} v, MIN(ts) lo, MAX(ts) hi "
+                "FROM r GROUP BY d, resolved_repo, model, user_email, src, sid"):
+            unknown = r["resolved_repo"] == "unknown"
+            key = (r["d"], r["resolved_repo"], normalize_model(r["model"]),
+                   r["user_email"] or UNKNOWN_USER,
+                   (r["src"] or "") if unknown else "",
+                   labels.get(r["sid"], "") if unknown else "")
+            yield key, r["v"], r["lo"], r["hi"]
+
     cost = {}
-    for r in store.db.execute(
-            f"WITH r AS ({resolved_view('cost_usage')}) "
-            "SELECT substr(ts,1,10) d, resolved_repo, model, user_email, "
-            "SUM(cost_usd) c, MIN(ts) lo, MAX(ts) hi "
-            "FROM r GROUP BY d, resolved_repo, model, user_email"):
-        key = (r["d"], r["resolved_repo"], normalize_model(r["model"]),
-               r["user_email"] or UNKNOWN_USER)
-        cost[key] = r["c"] or 0.0
-        _span(key, r["lo"], r["hi"])
+    for key, v, lo, hi in _scan("cost_usage", "SUM(cost_usd)"):
+        cost[key] = cost.get(key, 0.0) + (v or 0.0)
+        _span(key, lo, hi)
 
     toks = {}
-    for r in store.db.execute(
-            f"WITH r AS ({resolved_view('token_usage')}) "
-            "SELECT substr(ts,1,10) d, resolved_repo, model, user_email, "
-            "SUM(tokens) t, MIN(ts) lo, MAX(ts) hi "
-            "FROM r GROUP BY d, resolved_repo, model, user_email"):
-        key = (r["d"], r["resolved_repo"], normalize_model(r["model"]),
-               r["user_email"] or UNKNOWN_USER)
-        toks[key] = r["t"] or 0
-        _span(key, r["lo"], r["hi"])
+    for key, v, lo, hi in _scan("token_usage", "SUM(tokens)"):
+        toks[key] = toks.get(key, 0) + (v or 0)
+        _span(key, lo, hi)
 
     gen = _now_iso()
     line_rows = []
-    summ: dict = {}  # (day, repo, user_email) -> [tokens, cost, first, last]
+    summ: dict = {}  # (day, repo, user_email, source, label) -> [tokens, cost, first, last]
     for key in sorted(set(cost) | set(toks)):
-        day, repo_key, model, user = key
+        day, repo_key, model, user, src, label = key
         c = cost.get(key, 0.0)
         t = toks.get(key, 0)
         lo, hi = span[key]
@@ -110,22 +124,24 @@ def build(store: OtelStore, markup: float):
             "repo": bn, "repo_key": repo_key, "model": model, "user_email": user,
             "tokens": t, "actual_cost_usd": round(c, 6),
             "billed_usd": round(c * markup, 6),
-            "first_usage_at_utc": lo, "last_usage_at_utc": hi, "generated_at": gen})
-        agg = summ.setdefault((day, bn, user), [0, 0.0, lo, hi])
+            "first_usage_at_utc": lo, "last_usage_at_utc": hi, "generated_at": gen,
+            "attribution_source": src, "unattributed_project": label})
+        agg = summ.setdefault((day, bn, user, src, label), [0, 0.0, lo, hi])
         agg[0] += t
         agg[1] += c
         agg[2] = min(agg[2], lo)
         agg[3] = max(agg[3], hi)
 
     summary_rows = []
-    for (day, bn, user), (t, c, lo, hi) in sorted(summ.items()):
+    for (day, bn, user, src, label), (t, c, lo, hi) in sorted(summ.items()):
         ps, pe = f"{day[:7]}-01", _month_end(day[:7])
         summary_rows.append({
             "usage_date_utc": day, "period_start": ps, "period_end": pe,
             "repo": bn, "user_email": user, "tokens": t,
             "actual_cost_usd": round(c, 6), "markup": markup,
             "total_billed_usd": round(c * markup, 6),
-            "first_usage_at_utc": lo, "last_usage_at_utc": hi, "generated_at": gen})
+            "first_usage_at_utc": lo, "last_usage_at_utc": hi, "generated_at": gen,
+            "attribution_source": src, "unattributed_project": label})
     return summary_rows, line_rows
 
 
