@@ -40,9 +40,31 @@ def _allowed(email, domains) -> bool:
     return "@" in e and e.rsplit("@", 1)[1] in domains
 
 
-def unknown_rows(db_path, start=None, end=None, domains=("cyclotron.com",)):
-    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+_COLUMNS = {  # added by otel_store._migrate; absent on a store the receiver never migrated
+    "token_usage": [("usage_source", "TEXT NOT NULL DEFAULT 'otlp'"), ("entrypoint", "TEXT")],
+    "cost_usage": [("usage_source", "TEXT NOT NULL DEFAULT 'otlp'"),
+                   ("cost_source", "TEXT NOT NULL DEFAULT 'actual'")],
+}
+
+
+def _open_copy(db_path):
+    """In-memory copy of the store (SQLite backup API, safe on a live DB) with any
+    missing migration columns added to the COPY, so the live file is never touched."""
+    src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    db = sqlite3.connect(":memory:")
+    src.backup(db)
+    src.close()
     db.row_factory = sqlite3.Row
+    for table, cols in _COLUMNS.items():
+        have = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in cols:
+            if name not in have:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+    return db
+
+
+def unknown_rows(db_path, start=None, end=None, domains=("cyclotron.com",)):
+    db = _open_copy(db_path)
     labels = load_session_labels(db) if load_session_labels else {}
     agg: dict = {}
     for table, col, slot in (("token_usage", "SUM(tokens)", "tokens"),
