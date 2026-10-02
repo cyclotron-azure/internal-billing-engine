@@ -104,7 +104,9 @@ Telemetry starts with your **next** Claude Code session.
 Two things determine whether your usage can be attributed:
 
 - **Start sessions inside a git repo that has an `origin` remote.** Without one,
-  usage is recorded as `unknown` and cannot be attributed to any project.
+  usage is recorded as `unknown` and generally cannot be attributed to any project.
+  (If a session starts in a project folder and then moves into exactly one git repo
+  below it, the earlier usage is attributed to that repo.)
 - **The CLI and the VS Code extension are both captured.** The extension runs
   the `claude` CLI underneath, so it reports usage the same way a terminal
   session does — you do not need to change how you work.
@@ -161,5 +163,5 @@ command: `powershell -ExecutionPolicy Bypass -File .\install.ps1`
 | `cannot reach <url>` | Off VPN, or the receiver is down. Claude Code buffers telemetry **in memory only** and drops it when the process exits, so sessions run while the receiver is unreachable are never billed. |
 | Installer says Python is a Store alias stub | Install real Python: `winget install --id Python.Python.3.12 --scope user` |
 | `No token` / `No receiver endpoint` | This copy was built without the settings baked in. Ask for the one-click package, or pass `--token`/`--endpoint` yourself. |
-| Everything installed but usage shows as `unknown` | Sessions were started outside a git repo, or in one with no `origin` remote. |
+| Everything installed but usage shows as `unknown` | Sessions were started outside a git repo, or in one with no `origin` remote. Start the session inside the repo folder itself. |
 | It worked, then stopped | The Python it was installed against was moved or removed. Double-click the Install launcher again to re-point it. |

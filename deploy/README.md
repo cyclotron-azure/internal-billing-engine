@@ -108,6 +108,9 @@ Deployed as the `claude` entrypoint so every CLI session is stamped with its
 git remote (`OTEL_RESOURCE_ATTRIBUTES=repo=<remote>`). The receiver normalizes
 that remote and maps it to a client. Sessions started outside a git repo tag as
 `repo=unknown` and surface in the `unknown` bucket (flagged, never silently mis-billed).
+The one exception is applied at billing time, not by the wrapper: a session that
+starts in a project-level folder with no remote and later moves into exactly one real
+repo below it has that earlier usage attributed to the repo (see section 3 below).
 
 > The VS Code extension **does** export OTEL: it runs the `claude` CLI
 > underneath, so it picks up this wrapper (as long as the wrapper is the `claude`
@@ -176,7 +179,7 @@ done; unset IFS
 | `claude-wrapper: re-entered itself…` | Same as above, caught by the depth guard | Same as above. |
 | `claude-wrapper: could not find the real claude binary` | Wrapper is the only `claude`, or the real binary isn't executable/installed | Set `CLAUDE_REAL_BIN` in the shell environment (not managed-settings.json). |
 | `claude-wrapper: CLAUDE_REAL_BIN=… is this wrapper` | `CLAUDE_REAL_BIN` points at the wrapper instead of the real binary | Point it at the real binary, e.g. `/opt/cyclotron/claude-real`. |
-| All usage lands in `repo=unknown` | Sessions started outside a git repo, or the repo has no `origin` remote | Expected — the `unknown` bucket is flagged, never silently mis-billed. |
+| All usage lands in `repo=unknown` | Sessions started outside a git repo, or the repo has no `origin` remote (usage is recovered only if the session starts in a project-level folder and then moves into exactly one real repo below it) | Expected — the `unknown` bucket is flagged, never silently mis-billed. |
 | Usage tagged with the *wrong* repo | A user- or project-level `settings.json` pins `OTEL_RESOURCE_ATTRIBUTES` in its `env`, which overrides the wrapper's value | Remove the static `OTEL_RESOURCE_ATTRIBUTES` from that settings file. Note this repo's own `.claude/settings.local.json` pins one deliberately for local self-testing — that's dev-only, don't copy the pattern to a fleet machine. |
 
 ---
@@ -199,7 +202,11 @@ telemetry stream. A hook is the only signal that sees the transition.
 the git remote and POSTs one timeline entry to `POST /v1/session-repo`. At
 billing time `billing/otel/attribute.py` joins that timeline back onto each
 usage datapoint by `session_id` + `ts` (an "as-of" join), so usage splits across
-the repos it was actually done in.
+the repos it was actually done in. When the as-of folder has no remote (`unknown`),
+the usage inherits a real repo only if that folder is a project-level ancestor of
+(or the same as) the folders of the session's real-repo entries and those entries
+name exactly one repo; see the `attribute.py` entry in the top-level `README.md`
+for the exact rules.
 
 Hooks also run on **every** Claude Code surface — CLI, IDE extension, desktop,
 web — not just the CLI the wrapper shims.
@@ -244,8 +251,10 @@ sqlite3 ./otel-data/otel.db \
 ```
 
 Then `python -m billing.otel.bill` reports an **ATTRIBUTION SOURCE** breakdown
-(`timeline` / `wrapper` / `no_remote` / `absent`) and flags every multi-repo
-session, so you can see how much of the bill each signal is carrying.
+(`timeline` / `wrapper` / `no_remote` / `absent` / `desktop-scratch`) and lists every
+multi-repo session (diagnostic only: it reads the raw timeline, so a session whose
+`unknown` usage inherited a real repo still shows as split while billing wholly to
+that repo), so you can see how much of the bill each signal is carrying.
 
 ### Troubleshooting
 

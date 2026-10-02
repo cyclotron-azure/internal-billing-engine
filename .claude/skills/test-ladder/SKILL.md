@@ -72,7 +72,7 @@ package.
 | `billing/<module>.py` | `tests/test_<module>.py` |
 | `billing/otel/otel_store.py` | `tests/test_otel_store.py` **plus** every test that opens a store — `attribute`, `bill`, `invoice`, `export`, `receiver`, `integration_desktop` |
 | `billing/otel/normalize.py` | `tests/test_normalize.py` **plus** `test_attribute.py`, `test_bill.py` (repo keys flow through both) |
-| `billing/otel/attribute.py` | `tests/test_attribute.py` **plus** `test_bill.py`, `test_invoice.py` |
+| `billing/otel/attribute.py` | `tests/test_attribute.py` and `tests/test_attribute_inheritance.py` **plus** `test_bill.py`, `test_invoice.py` |
 | `billing/config.py` | any test that reads configuration — grep for `config` in `tests/` |
 | `deploy/**`, `client-package/**` | `tests/test_transcript_hook.py` **and** `tests/test_configure.py` — the former is the only coverage of `deploy/claude-transcript-usage.py`'s always-exit-0 discipline, an auto-fail trigger, so it runs even for a `client-package/**`-only change (that hook is mirrored into `client-package/`) |
 

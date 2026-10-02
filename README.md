@@ -150,14 +150,14 @@ Shared:
 - **`receiver.py`** — minimal OTLP/JSON HTTP server. Accepts `claude_code.token.usage` and `claude_code.cost.usage` from Claude Code (handles chunked + gzip bodies), extracts repo/user/model/token-type, dedupes, writes to the store. Also accepts `POST /v1/session-repo` from the repo-tag hook, and `POST /v1/transcript-usage` — a batched endpoint for desktop-app, CLI, and VS Code usage recovered from on-disk transcripts (see `transcript.py` below), with per-record rejection so one malformed record never costs the rest of a batch its billing. Exposes `GET /healthz` for liveness, with authenticated freshness detail when the bearer token matches `RECEIVER_AUTH_TOKEN`. Every POST must present the shared fleet token (`X-Billing-Token` or `Authorization: Bearer`) once `RECEIVER_AUTH_TOKEN` is set; unset means open, with a loud startup warning.
   `python -m billing.otel.receiver` (`--host`, `--port`, `--db`, `--require-auth`)
 - **`transcript.py`** — the wire-payload contract for `POST /v1/transcript-usage`: a 14-field schema (fail-closed — an unknown field, including `cwd`, is a per-record rejection, never silently ignored), per-record validation, `MAX_BATCH_SIZE=500`, and the mapping from one validated record to its `token_usage` rows (terminal-block collapse already done client-side) plus a rate-card-costed `cost_usage` row. Pure and stdlib-only — no I/O, no store access.
-- **`attribute.py`** — resolves *which repo a datapoint bills to*, at query time. Joins the `session_repo_timeline` onto each datapoint as-of its own timestamp, so a session that moved between repos splits across them. Falls back through `desktop-scratch → timeline → absent → no_remote → wrapper` (checked in that order — `desktop-scratch` is deliberately first: a scratch desktop session still gets a timeline row, but one that carries no billable repo, so it must be claimed before the `timeline` branch would otherwise claim it), and exposes that choice as `attribution_source` so you can see which signal is carrying the bill. Resolution is derived, never stored: a late or corrected timeline retroactively fixes past bills with no re-ingest.
+- **`attribute.py`** — resolves *which repo a datapoint bills to*, at query time. Joins the `session_repo_timeline` onto each datapoint as-of its own timestamp, so a session that moved between repos splits across them. Falls back through `desktop-scratch → timeline → absent → no_remote → wrapper` (checked in that order — `desktop-scratch` is deliberately first: a scratch desktop session still gets a timeline row, but one that carries no billable repo, so it must be claimed before the `timeline` branch would otherwise claim it), and exposes that choice as `attribution_source` so you can see which signal is carrying the bill. Resolution is derived, never stored: a late or corrected timeline retroactively fixes past bills with no re-ingest. **Ancestor inheritance:** when a datapoint's effective timeline row (the as-of row, else the session's first) is `unknown`, it inherits a real repo only if that row's folder is project-level and is the same as, or an ancestor of, the folder of related real-repo timeline rows (same folder or below it), and those rows name exactly one repo (a session that starts in a no-remote project folder and then `cd`s into the one real repo below it bills the earlier usage to that repo). It is ancestor-only (an unknown child of a real repo's folder stays `unknown`), real rows count whether they come before or after the datapoint, two or more distinct related repos leave it `unknown`, `DirectoryAdded` rows never serve as the real anchor, and the literal session id `unknown` never inherits. Roots, home folders, top-level folders directly under a root and generic container folders (`code`, `src`, `repos`, `projects`, `dev`, `OneDrive*`, `Visual Studio *`, …) are blocked anchors. Paths compare case-insensitively with `\` and `/` treated alike; SQLite `lower()` is ASCII-only, so non-ASCII case differences under-inherit (conservative). Inheritance is query-time SQL only, nothing is persisted, so a late second related repo can flip previously inherited usage back to `unknown`. Inherited rows report `attribution_source = timeline`.
 - **`project_label.py`** — turns one session's stored cwd history into a privacy-safe project-root label (`local:Dashnoard`) used only to explain `unknown` usage. Derived at query time from `session_repo_timeline`, never persisted, never a repo key. Read by `export.py`; see [Unattributed usage in the lake tables](#unattributed-usage-in-the-lake-tables).
 - **`otel_store.py`** — SQLite store: deduped `token_usage` and `cost_usage` datapoints (each carrying `usage_source` — `otlp` | `transcript` — plus `token_usage.entrypoint` and `cost_usage.cost_source` — `actual` | `rate_card` — so desktop-sourced rows are distinguishable from CLI/OTLP ones), `dedupe_drops` (per-`(day, token_type, usage_source)` count of datapoints rejected as duplicates), the `session_repo_timeline`, persisted invoices + line items, the optional `repo_name_map` override table, and the `fabric_outbox` delivery queue. The counting-start epoch in `meta` is written by the insert path, not by migration, so a store opened only by a read-only consumer never acquires one — which is what lets `reconcile.py` distinguish "never counted" from "counted, zero duplicates".
 - **`normalize.py`** — collapses git remote forms (ssh vs https, `.git`, case) into one canonical repo key so a repo isn't billed twice, and derives the short repo name (`repo_name`) that is the billing identity.
 - **`repos.py`** — manage the OPTIONAL repo→billing-name override map: `export` observed repos to CSV, edit the `bill_name` column to rename/group a repo, then `import`. Not needed by default — every repo bills under its own name.
   `python -m billing.otel.repos export --out repo_name_map.csv`
 - **`rating.py`** — `RatingService`: token counts → billable USD (per-model rates × markup, cache-token multipliers) RATES ARE PLACEHOLDERS AND NEED TO BE REPLACED W/ REAL PRICES
-- **`bill.py`** — aggregates usage → repo, bills on actual cost (`claude_code.cost.usage`) × markup with a rate-card cross-check; flags `unknown` usage (sessions with no git remote) and prints an **ATTRIBUTION SOURCE** breakdown plus every multi-repo session. `python -m billing.otel.bill`
+- **`bill.py`** — aggregates usage → repo, bills on actual cost (`claude_code.cost.usage`) × markup with a rate-card cross-check; flags `unknown` usage (sessions with no git remote that did not inherit a real repo) and prints an **ATTRIBUTION SOURCE** breakdown plus every multi-repo session. The multi-repo list is diagnostic only (`multi_repo_sessions()` reads the raw timeline repos), so a session whose `unknown` usage inherits a real repo still prints as split across repos while billing wholly to the real repo; billing amounts are unaffected. `python -m billing.otel.bill`
 - **`invoice.py`** — generates per-repo invoices for a billing period: persists immutable invoice + line-item records and writes a human-readable `.txt` invoice + `summary.csv` / `line_items.csv` under `invoices/`. `python -m billing.otel.invoice --start 2026-07-01 --end 2026-08-01`
 - **`records.py`** — dumps individual usage records with their repo tag + resolved billing name.
 - **`sample_payload.py`** — generates a synthetic OTLP payload to exercise the pipeline without live machines.
@@ -286,7 +286,7 @@ queryable Delta tables inside Microsoft Fabric.
 ```
 receiver.py (ingest telemetry + session→repo timeline)
         ↓
-attribute.py (as-of join: which repo was active per datapoint)
+attribute.py (as-of join: which repo was active per datapoint; an `unknown` row may inherit one related real repo)
         ↓
 bill  →  reconcile (coverage check)  →  invoice (per period)
 
@@ -368,12 +368,17 @@ timeline (always for `no_remote` and `absent`).
 
 | Value | Meaning |
 |---|---|
-| `timeline` | The repo hook fired, but the folder it reported has no git remote (a plain folder, an unzipped download, or a local repo with no `origin`). |
+| `timeline` | The repo hook fired, but the folder it reported has no git remote (a plain folder, an unzipped download, or a local repo with no `origin`) and the usage could not inherit a real repo: no real-repo timeline row in the session at or below that folder (for example an unrelated sibling folder, or a session whose timeline rows are all `unknown`), an empty or missing cwd, a blocked anchor folder (root, home, top-level or generic container), an unknown child of a real repo's folder, two or more related real repos, only a `DirectoryAdded` anchor, or the literal session id `unknown`. |
 | `no_remote` | No timeline rows; the launch-time wrapper tag was `unknown` because the launch directory had no git remote (a local repo with no remote counts). |
 | `absent` | No repo signal ever arrived: the hook is not installed or not firing, or the surface never ran the wrapper. |
 | `desktop-scratch` | Transcript-sourced usage (desktop app, and the cli / VS Code transcript backfill) with no billable repo. |
 
 `wrapper` is not expected on `unknown` rows: it only resolves to a real repo.
+
+Sessions that start in a project-level ancestor folder with no remote and later move
+into exactly one real repo below it no longer produce `unknown` rows (ancestor
+inheritance in `attribute.py`), so that usage gets no `local:<folder>` label; history
+relabels after re-export.
 
 **`unattributed_project`** names the project the developer was working in, as the
 root folder name only (`local:Dashnoard`). It is a hint for diagnosis, not a repo:
@@ -413,8 +418,10 @@ it is never a repo key and never billed, and `resolved_repo`, invoices and
 
 Accepted mislabels: a session that visits a real ancestor folder outside the outer
 zone (e.g. `C:\Cyclotron`) takes that ancestor as its root, and a session that
-starts in a real repo and then works in a no-remote folder labels those `unknown`
-rows with the start folder's name. Known gaps, not fixed here: hook scratchpad
+starts in a real repo and then works in a no-remote child folder labels those `unknown`
+rows with the start folder's name (inheritance is ancestor-only: that direction stays
+`unknown`, whereas a session that starts in an unknown ancestor folder and then moves
+into one real repo below it now inherits that repo). Known gaps, not fixed here: hook scratchpad
 detection for the project-slug layout, and cwd-based undercounting of work done in
 another repo by absolute path.
 
@@ -507,7 +514,9 @@ sessions are permanently unbilled. Two viable postures:
 
 The real developer-facing cost is behavioral, not performance: sessions must
 start **inside a git repo with an `origin` remote** (else `repo=unknown`, which is
-unattributable). That is a coverage problem wearing UX clothing.
+unattributable, unless the session starts in a project-level ancestor folder and later
+moves into exactly one real repo below it, in which case that usage is recovered at
+query time). That is a coverage problem wearing UX clothing.
 
 The **VS Code extension does export OTEL** — it drives the `claude` CLI
 underneath, so it inherits the CLI's exporter and the wrapper's `repo=` resource
@@ -565,7 +574,8 @@ The pilot exists to produce numbers that cannot be estimated:
   export interval flushes, desktop-app/CLI/VS Code sessions not yet swept by the
   transcript hook); captured→tagged
   is the `unknown`
-  bucket (sessions outside a git repo). `--daily`/`--by-surface` (or `--detail`
+  bucket (sessions outside a git repo; it shrinks as ancestor-start sessions that
+  later enter one real repo are recovered). `--daily`/`--by-surface` (or `--detail`
   for both) break the funnel down per-day and per-surface, so a receiver
   outage shows up as a one-day cliff instead of being averaged away across
   the whole window.
@@ -605,7 +615,14 @@ client.** Invoices will be built on it.
    `GROUP BY` scan. Correct, simple, and fine for year one; it degrades as raw
    datapoints accumulate. Multiply the pilot's rows/dev/day by fleet size to find
    the date. The `unknown` breakdown adds a per-datapoint class lookup for `unknown`
-   rows only, plus one read of the session timeline per build. Plan a compaction step (roll datapoints older than ~90 days into
+   rows only, plus one read of the session timeline per build. Every `resolved_view` statement
+   also builds the ancestor-inheritance lookup over the WHOLE `session_repo_timeline`
+   regardless of the query's date window, so cost grows with total timeline rows
+   (`UserPromptSubmit` re-tagging adds rows on every prompt); measured at about 0.24 s
+   per 100,000 datapoints for a plain `resolved_view` scan, up to about 0.87 s per
+   100,000 datapoints for the real export / bill statements (one statement per
+   process, on synthetic stores of ~100k-130k datapoints and ~40k-44k timeline rows;
+   load-dependent, about 0.33 s on a quiet machine), not on production data. Plan a compaction step (roll datapoints older than ~90 days into
    daily aggregates, prune) before the DB reaches a few GB.
 
 If Phase 0 says the fleet is large (~500+ devs), skip the SQLite hardening: put an
