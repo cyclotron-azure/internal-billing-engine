@@ -129,7 +129,9 @@ def resolve_repo(session_id: str, ts: str, otel_db_path: str | None = None) -> t
     otel.db's session_repo_timeline table -- read-only, query-time only,
     never persisted.
 
-    Mirrors attribute.py's real fallback chain (not a simplified one):
+    Mirrors attribute.py's as-of / earliest-entry fallback chain (not a simplified
+    one), but NOT its ancestor-inheritance rule: an `unknown` timeline row stays
+    `unknown` here (Cowork attribution is a separate, unchanged path):
     COALESCE(as-of match, earliest-timeline-entry match). `attribution_source`
     is "timeline" whenever EITHER query matches (the session has at least
     one relevant timeline row), and "absent" only when the session has NO
